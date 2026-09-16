@@ -1,0 +1,50 @@
+# VulEvalBench dependencies.
+#
+# Pinned to minimum versions rather than exact ones: this is a research tool
+# that should keep working as its dependencies move, and an exact pin would
+# force a lockstep upgrade of the whole set for one security patch.
+#
+# Install with:
+#     pip install -r requirements.txt
+
+# --- pipeline core ---------------------------------------------------------
+requests>=2.31           # HTTP client for Ollama and the OpenAI-compatible API
+pydantic>=2.0            # schema types used by the pipeline stages
+pyflakes>=3.0            # undefined-name detection in generated samples
+#
+# pyflakes is used by generate.py, not as a detector. Generated code that parses
+# but cannot run (a call to an unimported module, say) would otherwise reach the
+# judges, be correctly rejected, and cost two judgment calls to discover what a
+# static check finds for free.
+
+# --- web interface ---------------------------------------------------------
+flask>=3.0               # routing and templating
+waitress>=3.0            # production WSGI server used in the container
+
+# --- detector arm 1: static analysis --------------------------------------
+bandit>=1.7              # AST pattern matching; reports a CWE per finding
+ruff>=0.5                # Rust reimplementation of Bandit's flake8-bandit rules
+semgrep>=1.173           # pattern matching PLUS taint analysis
+#
+# All three run side by side. Ruff is deliberately the least independent: it
+# shares Bandit's ruleset, so where the two disagree the rule cannot be the
+# explanation -- which separates a rule's limits from a tool's.
+#
+# The semgrep floor is deliberate rather than cautious. Releases before ~1.173
+# had no Windows distribution at all: `pip install semgrep` succeeded and
+# installed no runnable binary, which is why an earlier draft ran Ruff in its
+# place. 1.173 ships a working semgrep.exe, so all three now run together
+# rather than one substituting for another.
+#
+# Semgrep fetches its ruleset (p/python) from semgrep.dev on first use and
+# caches it afterwards, so the first run on a machine needs network access.
+
+# --- detector arm 2: machine learning -------------------------------------
+scikit-learn>=1.4        # logistic regression, TF-IDF, stratified CV
+numpy>=1.26              # array handling for the embedding features
+
+# --- optional: Anthropic models -------------------------------------------
+# Needed only if an Anthropic key is supplied in api-key-llm.txt. With one,
+# Claude models can be selected as judges or as LLM detectors alongside the
+# Passau-hosted models. The pipeline runs fine without it.
+anthropic>=0.70

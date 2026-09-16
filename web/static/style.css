@@ -1,0 +1,450 @@
+/* =====================================================================
+   VulEvalBench -- stylesheet.
+
+   One file, no framework, no build step, no CDN. The container serves this
+   directly and the interface works offline.
+
+   Layout: a fixed-width left sidebar holding navigation and configuration,
+   and a fluid main column for output. Tables are the primary content, so most
+   of the work here is making dense numeric tables readable.
+
+   Colour is used semantically and sparingly:
+     green   a correct verdict, an available tool, a healthy service
+     red     a wrong verdict, a dropped sample, an unavailable tool
+     amber   a warning that does not stop the run
+   ===================================================================== */
+
+:root {
+  --bg:          #10131a;
+  --bg-panel:    #171b24;
+  --bg-card:     #1b2029;
+  --bg-input:    #11141b;
+  --border:      #2a3140;
+  --text:        #dfe4ec;
+  --text-muted:  #8d97a8;
+  --accent:      #5aa9ff;
+  --accent-dim:  #2b5f9e;
+  --ok:          #4ec98a;
+  --bad:         #ef6b6b;
+  --warn:        #e0b050;
+  --vuln:        #ff9a6a;
+
+  --radius: 7px;
+  --mono: "Cascadia Mono", "SF Mono", Consolas, "Liberation Mono", monospace;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+code, .mono, pre { font-family: var(--mono); }
+code { font-size: 0.9em; color: var(--accent); }
+
+h1 { font-size: 1.5rem; margin: 0 0 .3rem; font-weight: 600; }
+h2 { font-size: 1.1rem; margin: 0 0 .9rem; font-weight: 600; }
+h3 { font-size: .95rem; margin: 1.6rem 0 .6rem; font-weight: 600;
+     color: var(--text-muted); text-transform: uppercase;
+     letter-spacing: .05em; }
+
+/* ---------------------------------------------------------------------
+   Layout
+   --------------------------------------------------------------------- */
+
+.layout { display: flex; min-height: 100vh; align-items: flex-start; }
+
+.sidebar {
+  width: 310px;
+  flex: 0 0 310px;
+  background: var(--bg-panel);
+  border-right: 1px solid var(--border);
+  padding: 1.1rem 1rem 3rem;
+  /* The sidebar holds the whole configuration form, which is taller than the
+     viewport; it scrolls independently so the main column is not dragged
+     along with it. */
+  position: sticky;
+  top: 0;
+  max-height: 100vh;
+  overflow-y: auto;
+}
+
+.main {
+  flex: 1;
+  padding: 1.6rem 2rem 4rem;
+  min-width: 0;          /* lets wide tables scroll instead of stretching */
+}
+
+/* ---------------------------------------------------------------------
+   Sidebar: brand and navigation
+   --------------------------------------------------------------------- */
+
+.brand { margin-bottom: 1.2rem; }
+.brand-name { display: block; font-weight: 650; font-size: 1.05rem; }
+.brand-sub  { display: block; font-size: .74rem; color: var(--text-muted); }
+
+.nav { display: flex; flex-direction: column; gap: 2px; }
+
+.nav-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: .45rem .6rem;
+  border-radius: var(--radius);
+  color: var(--text);
+  font-size: .9rem;
+}
+.nav-item:hover { background: #1f2532; text-decoration: none; }
+.nav-item.active { background: var(--accent-dim); color: #fff; }
+
+.count {
+  background: #2a3140;
+  border-radius: 10px;
+  padding: 0 .45rem;
+  font-size: .72rem;
+  color: var(--text-muted);
+}
+
+.nav-section { margin-top: 1rem; }
+.nav-group { margin: .3rem 0 .5rem .5rem; }
+.nav-group-title {
+  font-size: .68rem;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--text-muted);
+  margin: .5rem 0 .2rem;
+}
+.nav-sub {
+  display: flex;
+  align-items: center;
+  gap: .4rem;
+  font-size: .8rem;
+  color: var(--text-muted);
+  padding: .12rem 0 .12rem .3rem;
+}
+
+/* Availability indicator, reused in the tool catalogue. */
+.dot {
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  flex: 0 0 7px;
+  background: var(--text-muted);
+}
+.dot.up   { background: var(--ok); }
+.dot.down { background: var(--bad); }
+
+.status-panel {
+  margin-top: 1.4rem;
+  padding: .7rem .6rem;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.status-title {
+  font-size: .68rem; text-transform: uppercase; letter-spacing: .06em;
+  color: var(--text-muted); margin-bottom: .45rem;
+}
+.status-row {
+  display: flex; align-items: center; gap: .45rem;
+  font-size: .78rem; color: var(--text-muted); padding: .1rem 0;
+}
+
+/* ---------------------------------------------------------------------
+   Sidebar: configuration form
+   --------------------------------------------------------------------- */
+
+.config-panel { margin-top: 1.4rem; }
+
+.config-title {
+  font-size: .7rem; text-transform: uppercase; letter-spacing: .07em;
+  color: var(--accent); font-weight: 600;
+  padding-bottom: .3rem; margin-bottom: .6rem;
+  border-bottom: 1px solid var(--border);
+}
+.config-title.spaced { margin-top: 1.5rem; }
+
+.field { display: block; margin-bottom: .8rem; }
+.field-label {
+  display: block; font-size: .78rem; color: var(--text-muted);
+  margin-bottom: .22rem;
+}
+.field small {
+  display: block; font-size: .7rem; color: var(--text-muted);
+  margin-top: .22rem; line-height: 1.35;
+}
+
+.field input[type="text"],
+.field input[type="number"],
+.field select {
+  width: 100%;
+  padding: .38rem .5rem;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--text);
+  font-size: .85rem;
+  font-family: inherit;
+}
+.field select[multiple] { padding: .25rem; }
+.field input:focus, .field select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.field.checkbox {
+  display: flex; align-items: center; gap: .45rem;
+  font-size: .82rem; margin-bottom: .35rem; cursor: pointer;
+}
+.field.checkbox input { margin: 0; }
+
+.tool-group { margin-bottom: .8rem; }
+.tool-group-title {
+  font-size: .68rem; text-transform: uppercase; letter-spacing: .06em;
+  color: var(--text-muted); margin-bottom: .3rem;
+}
+
+/* Explains which backend serves the dropdown above it. Ollama is a model
+   server rather than a model, so there is no "use Ollama" option to tick --
+   this note is what makes that relationship visible in the interface instead
+   of only in the documentation. */
+.backend-note {
+  display: flex;
+  align-items: flex-start;
+  gap: .4rem;
+  font-size: .72rem;
+  line-height: 1.4;
+  color: var(--text-muted);
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: .4rem .5rem;
+  margin-top: .3rem;
+}
+.backend-note .dot { margin-top: .34rem; }
+.backend-note strong { color: var(--text); }
+.backend-note code { font-size: .95em; }
+
+/* CWE catalogue toggles. */
+.chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: .2rem; }
+.chip {
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  border-radius: 4px;
+  padding: .16rem .38rem;
+  font: .7rem var(--mono);
+  cursor: pointer;
+}
+.chip.selected {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.actions { margin-top: 1.1rem; }
+
+button.primary {
+  width: 100%;
+  padding: .55rem;
+  background: var(--accent);
+  color: #06121f;
+  border: none;
+  border-radius: var(--radius);
+  font-size: .9rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+button.primary:hover:not(:disabled) { background: #78baff; }
+button.primary:disabled { background: #33445c; color: #7f8ea3; cursor: default; }
+
+/* ---------------------------------------------------------------------
+   Main column
+   --------------------------------------------------------------------- */
+
+.page-header { margin-bottom: 1.3rem; }
+.page-header .sub { margin: 0; color: var(--text-muted); font-size: .88rem;
+                    max-width: 70ch; }
+
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.1rem 1.2rem;
+  margin-bottom: 1.1rem;
+}
+
+.hint  { color: var(--text-muted); font-size: .84rem; margin: .3rem 0 .8rem;
+         max-width: 82ch; }
+.note  { color: var(--text-muted); font-size: .83rem; margin: .4rem 0; }
+.muted { color: var(--text-muted); }
+.small { font-size: .78rem; }
+.strong { font-weight: 600; }
+
+.warn {
+  color: var(--warn);
+  font-size: .78rem;
+  background: rgba(224, 176, 80, .08);
+  border-left: 2px solid var(--warn);
+  padding: .45rem .6rem;
+  border-radius: 3px;
+  margin: .5rem 0;
+}
+
+.notes { margin: .4rem 0; padding-left: 1.1rem; color: var(--text-muted);
+         font-size: .85rem; max-width: 88ch; }
+.notes li { margin-bottom: .5rem; }
+.notes strong { color: var(--text); }
+
+.formula {
+  font-family: var(--mono);
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: .6rem .8rem;
+  font-size: .86rem;
+}
+
+/* Tabs on the run detail page. */
+.tabs { display: flex; gap: 4px; margin-bottom: 1rem; }
+.tab {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  padding: .4rem .9rem;
+  border-radius: var(--radius);
+  font-size: .85rem;
+  cursor: pointer;
+}
+.tab.active { background: var(--accent-dim); color: #fff;
+              border-color: var(--accent); }
+
+/* ---------------------------------------------------------------------
+   Stats, logs and code
+   --------------------------------------------------------------------- */
+
+.stats { display: flex; flex-wrap: wrap; gap: .6rem; margin-bottom: 1rem; }
+.stat {
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: .45rem .7rem;
+  min-width: 110px;
+}
+.stat-label { display: block; font-size: .68rem; color: var(--text-muted);
+              text-transform: uppercase; letter-spacing: .05em; }
+.stat-value { display: block; font-size: .95rem; font-weight: 600;
+              margin-top: .1rem; }
+
+.log, .code {
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: .7rem .8rem;
+  font-family: var(--mono);
+  font-size: .8rem;
+  line-height: 1.5;
+  overflow-x: auto;
+  white-space: pre;
+  margin: 0;
+}
+.log { max-height: 380px; overflow-y: auto; }
+.code { max-height: 620px; overflow-y: auto; }
+
+.badge {
+  display: inline-block;
+  padding: .1rem .45rem;
+  border-radius: 4px;
+  font-size: .7rem;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  background: #2a3140;
+  color: var(--text-muted);
+  vertical-align: middle;
+}
+.badge.done, .badge.evaluated, .badge.detected { background: rgba(78,201,138,.16);
+                                                 color: var(--ok); }
+.badge.error, .badge.failed { background: rgba(239,107,107,.16); color: var(--bad); }
+.badge.generating, .badge.judging, .badge.detecting, .badge.evaluating,
+.badge.ingesting, .badge.starting { background: rgba(90,169,255,.16);
+                                    color: var(--accent); }
+
+/* ---------------------------------------------------------------------
+   Tables
+   --------------------------------------------------------------------- */
+
+.scroll { overflow-x: auto; }
+
+table { border-collapse: collapse; width: 100%; font-size: .82rem; }
+
+th {
+  text-align: left;
+  padding: .42rem .55rem;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-muted);
+  font-weight: 600;
+  font-size: .72rem;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  white-space: nowrap;
+}
+
+td {
+  padding: .38rem .55rem;
+  border-bottom: 1px solid #232936;
+  white-space: nowrap;
+}
+
+tbody tr:hover { background: #1f2532; }
+
+tr.clickable { cursor: pointer; }
+
+/* A sample the judges rejected. Dimmed rather than hidden: the dropped rows
+   are evidence about the generator, and hiding them would hide that. */
+tr.dropped td { opacity: .55; }
+tr.dropped td:first-child { border-left: 2px solid var(--bad); }
+
+td.ok   { color: var(--ok); }
+td.bad  { color: var(--bad); }
+td.vuln { color: var(--vuln); font-weight: 600; }
+td.safe { color: var(--ok); }
+
+/* ---------------------------------------------------------------------
+   Tool catalogue
+   --------------------------------------------------------------------- */
+
+.tool-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: .7rem .85rem;
+  margin-bottom: .7rem;
+  background: var(--bg-input);
+}
+.tool-head { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
+.tool-name { font-weight: 600; }
+.tool-key  { font-size: .74rem; color: var(--text-muted); }
+.tool-blurb { margin: .4rem 0 .2rem; font-size: .85rem; color: var(--text-muted);
+              max-width: 88ch; }
+.tool-needs { margin: 0; }
+
+.run-block { margin-bottom: 1.6rem; }
+.run-block h3 { margin-top: 0; text-transform: none; letter-spacing: 0;
+                font-size: .9rem; color: var(--text); }
+
+/* ---------------------------------------------------------------------
+   Narrow screens
+   --------------------------------------------------------------------- */
+
+@media (max-width: 900px) {
+  .layout { flex-direction: column; }
+  .sidebar {
+    width: 100%; flex: none; position: static; max-height: none;
+    border-right: none; border-bottom: 1px solid var(--border);
+  }
+  .main { padding: 1.2rem; }
+}

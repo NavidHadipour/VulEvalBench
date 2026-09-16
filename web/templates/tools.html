@@ -1,0 +1,185 @@
+{% extends "base.html" %}
+{#
+  The tool catalogue.
+
+  One card per detector, grouped by paradigm, explaining what the tool actually
+  does and whether it can run in this environment. The availability dot matters:
+  a tool with an unmet prerequisite is disabled in the run configuration rather
+  than being allowed to fail halfway through a job.
+#}
+
+{% block title %}Tools &mdash; VulEvalBench{% endblock %}
+
+{% block content %}
+<header class="page-header">
+  <h1>Tools</h1>
+  <p class="sub">
+    Three detection paradigms, scored under one evaluation protocol. Every tool
+    returns the same verdict shape, so <code>evaluate.py</code> scores them all
+    with one code path and none gets a bespoke advantage.
+  </p>
+</header>
+
+{% for arm, entries in arms.items() %}
+  {% if entries %}
+    <section class="card">
+      <h2>{{ arm_names[arm] }}</h2>
+
+      {% for entry in entries %}
+        <div class="tool-card">
+          <div class="tool-head">
+            <span class="dot {{ 'up' if tool_status.get(entry.key) else 'down' }}"></span>
+            <span class="tool-name">{{ entry.name }}</span>
+            <code class="tool-key">{{ entry.key }}</code>
+            {% if not tool_status.get(entry.key) %}
+              <span class="badge error">unavailable</span>
+            {% endif %}
+          </div>
+          <p class="tool-blurb">{{ entry.blurb }}</p>
+          <p class="tool-needs muted small">Requires: <code>{{ entry.needs }}</code></p>
+        </div>
+      {% endfor %}
+    </section>
+  {% endif %}
+{% endfor %}
+
+<!-- Where the models actually run. Added because the relationship between
+     Ollama and a model tag is genuinely unobvious from the run page alone:
+     Ollama never appears as a selectable option, because it is the server that
+     runs the options rather than one of them. -->
+<section class="card">
+  <h2>Model infrastructure</h2>
+  <p class="hint">
+    Three separate services provide the models this framework uses. Knowing
+    which is which explains why the dropdowns on the run page list completely
+    different names from one another.
+  </p>
+
+  <div class="scroll">
+    <table>
+      <thead>
+        <tr>
+          <th>Service</th><th>Runs where</th><th>Used for</th>
+          <th>Chosen on the run page as</th><th>Cost</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="strong">Ollama</td>
+          <td>this machine, port 11434</td>
+          <td>generating benchmark samples</td>
+          <td>Generator model</td>
+          <td>free</td>
+        </tr>
+        <tr>
+          <td class="strong">Judgment API</td>
+          <td>remote, OpenAI-compatible</td>
+          <td>judging, LLM detection, embeddings</td>
+          <td>Judge A / Judge B, LLM detector</td>
+          <td>per token</td>
+        </tr>
+        <tr>
+          <td class="strong">Anthropic</td>
+          <td>remote (optional)</td>
+          <td>optional second-vendor detector</td>
+          <td>&mdash;</td>
+          <td>per token</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <ul class="notes">
+    <li>
+      <strong>Ollama is a model server, not a model.</strong> There is no
+      &ldquo;use Ollama&rdquo; option to tick, because selecting any tag in the
+      Generator dropdown already means Ollama &mdash; that list is populated
+      solely from what your local Ollama server has pulled
+      (<code>ollama list</code>). Add to it with
+      <code>ollama pull &lt;name&gt;</code> and reload the page.
+    </li>
+    <li>
+      <strong>Generation runs locally on purpose.</strong> It is by far the
+      most token-hungry stage &mdash; two complete programs per call &mdash; so
+      running it locally makes scaling to several hundred samples free. It also
+      guarantees the model that <em>writes</em> a sample is never the model that
+      <em>certifies</em> it, which removes self-preference bias by construction.
+    </li>
+    <li>
+      <strong>Generator size is a hardware decision.</strong> Without a CUDA
+      GPU, Ollama runs entirely on CPU. On the development machine
+      <code>qwen2.5-coder:3b</code> took ~45&nbsp;s per pair while
+      <code>qwen2.5-coder:7b</code> took ~457&nbsp;s and repeatedly ran out of
+      memory. Check <code>ollama ps</code> while a model is loaded: a
+      <code>PROCESSOR</code> column reading <code>100% CPU</code> means no GPU
+      offload, and larger models will be slow.
+    </li>
+  </ul>
+</section>
+
+<section class="card">
+  <h2>How the arms are measured differently</h2>
+  <ul class="notes">
+    <li>
+      <strong>Static analysers</strong> report findings, not per-file verdicts.
+      A file with no relevant finding is taken as a claim that the file is
+      clean. By default only findings whose CWE is in the benchmark's catalogue
+      count towards a verdict &mdash; otherwise unrelated hygiene warnings
+      (&ldquo;request without timeout&rdquo;) would flag every sample and push
+      the false positive rate to 1.0 for reasons unconnected to the question
+      being asked. Both the scoped and unscoped finding counts are recorded in
+      every result file.
+    </li>
+    <li>
+      <strong>ML models</strong> are the only arm that learns from the data it
+      is scored on, so every prediction is made <em>out of fold</em>: the model
+      that labelled a sample was fitted without ever seeing it. Scoring them on
+      their training data would report memorisation as detection and would be
+      wildly unfair to the other two arms, which never see a label at all. This
+      difference in protocol must be stated in any write-up.
+    </li>
+    <li>
+      <strong>LLM detectors</strong> are shown the candidate CWE list so their
+      category answers are comparable with ground truth. That is a small
+      advantage over the static tools, which map findings to categories through
+      a fixed rule table and cannot choose from a list.
+    </li>
+    <li>
+      The default LLM detector is deliberately a <em>different</em> model from
+      the judges. A model that helped certify a sample must not also be graded
+      on finding the vulnerability in it.
+    </li>
+  </ul>
+</section>
+
+<section class="card">
+  <h2>Adding another tool</h2>
+  <p class="hint">
+    A new detector joins the comparison by writing the common result shape into
+    a run's <code>03_detection/</code> directory &mdash; nothing in
+    <code>evaluate.py</code> changes. Register it in
+    <code>src/detectors/__init__.py</code> and add its runner to
+    <code>RUNNERS</code> in <code>src/detect.py</code>.
+  </p>
+  <pre class="code">{
+  "detector":      "My tool",
+  "detector_key":  "static_mytool",
+  "detector_type": "static",
+  "predictions": [
+    {"id": "sample_001",
+     "predicted_label": "vulnerable",
+     "predicted_cwe":   "CWE-89",
+     "confidence":      0.82,
+     "reasoning":       "why"}
+  ]
+}</pre>
+  <p class="hint">
+    Semgrep was the original second static analyser and is what the earlier
+    draft named. It is absent here because it has no working Windows
+    distribution &mdash; <code>pip install semgrep</code> succeeds but installs
+    no runnable binary. On Linux, or inside the Docker image, it drops in as a
+    third static detector without changes outside
+    <code>src/detectors/static_tools.py</code>.
+  </p>
+</section>
+{% endblock %}

@@ -1,0 +1,525 @@
+{% extends "base.html" %}
+{#
+  The run page.
+
+  Everything configurable lives in the sidebar, as the supervisor asked; the
+  main column is progress and results only. Values set here override config.py
+  for one run -- the file itself is never modified, so the committed defaults
+  stay the reproducible ones.
+#}
+
+{% block title %}New run &mdash; VulEvalBench{% endblock %}
+
+{% block sidebar_extra %}
+<div class="config-panel">
+  <div class="config-title">Configuration</div>
+
+  <!-- --- where the samples come from ------------------------------------
+       Generated is the benchmark proper. GitHub and local ingest real code,
+       which has no ground truth -- the warning below says so, because
+       accuracy-style metrics are silently omitted for those runs. -->
+  <label class="field">
+    <span class="field-label">Sample source</span>
+    <select id="source">
+      <option value="generated" selected>Generate new samples</option>
+      <option value="github">GitHub repository</option>
+      <option value="local">Local files or folder</option>
+      <option value="existing">Re-analyse a previous run</option>
+    </select>
+  </label>
+
+  <!-- Shown only for the generated source. -->
+  <div id="generate-fields">
+    <label class="field">
+      <span class="field-label">Pairs</span>
+      <input type="number" id="pairs" value="{{ default_pairs }}"
+             min="{{ min_pairs }}" max="{{ max_pairs }}">
+      <small>Each pair = 1 vulnerable + 1 safe twin</small>
+    </label>
+
+    <!-- The generator block is labelled explicitly with its backend. Ollama is
+         a model *server*, not a model, so there is no "use Ollama" option to
+         tick -- choosing any tag in this dropdown is choosing Ollama, because
+         the list comes from that server's pulled models and nowhere else.
+         Saying so here stops the question being asked of the code. -->
+    <div class="field">
+      <span class="field-label">Generator model</span>
+      <select id="generator_model">
+        {% for model in ollama_models %}
+          <option value="{{ model }}"
+            {% if model == default_generator %}selected{% endif %}>{{ model }}</option>
+        {% else %}
+          <option value="">no models pulled</option>
+        {% endfor %}
+      </select>
+      <div class="backend-note">
+        <span class="dot {{ 'up' if ollama_up else 'down' }}"></span>
+        <span>
+          Served by <strong>Ollama</strong> on this machine
+          {% if ollama_up %}
+            &mdash; {{ ollama_models|length }} model{{ '' if ollama_models|length == 1 else 's' }} pulled.
+            Runs locally, so generation costs nothing per call.
+          {% else %}
+            &mdash; <strong>server not reachable.</strong> Start it with
+            <code>ollama serve</code>, then reload this page.
+          {% endif %}
+        </span>
+      </div>
+    </div>
+
+    <label class="field">
+      <span class="field-label">CWE selection</span>
+      <select id="cwe_selection">
+        <option value="random" {% if cwe_selection == 'random' %}selected{% endif %}>
+          Random (independent draws)
+        </option>
+        <option value="cycle" {% if cwe_selection == 'cycle' %}selected{% endif %}>
+          Cycle (balanced coverage)
+        </option>
+      </select>
+      <small>Random matches the brief; cycle guarantees balance</small>
+    </label>
+
+    <label class="field">
+      <span class="field-label">Seed</span>
+      <input type="number" id="seed" value="{{ default_seed }}">
+      <small>Blank = fresh randomness</small>
+    </label>
+
+    <!-- The catalogue is a property of the benchmark design, so it is shown
+         as toggleable chips rather than free text. All on by default. -->
+    <div class="field">
+      <span class="field-label">CWE catalogue ({{ cwes|length }})</span>
+      <div class="chips" id="cwe-chips">
+        {% for cwe, name in cwes %}
+          <button type="button" class="chip selected"
+                  data-cwe="{{ cwe }}" title="{{ name }}">{{ cwe }}</button>
+        {% endfor %}
+      </div>
+      <small>Click to include or exclude a category</small>
+    </div>
+  </div>
+
+  <!-- Shown for the github and local sources. -->
+  <div id="ingest-fields" hidden>
+    <label class="field">
+      <span class="field-label">Repository URL or path</span>
+      <input type="text" id="ingest_source"
+             placeholder="https://github.com/owner/repo">
+    </label>
+    <label class="field">
+      <span class="field-label">Maximum files</span>
+      <input type="number" id="max_files" value="20"
+             min="1" max="{{ max_ingest_files }}">
+    </label>
+    <p class="warn small">
+      Real code has no ground-truth labels, so accuracy, precision, recall, F1
+      and MCC are omitted for these runs. Tool agreement stays valid.
+    </p>
+  </div>
+
+  <!-- Shown for the existing source. Populated from /api/runs. -->
+  <div id="existing-fields" hidden>
+    <label class="field">
+      <span class="field-label">Previous run</span>
+      <select id="existing_run"></select>
+      <small>Re-runs the tools without regenerating samples</small>
+    </label>
+  </div>
+
+  <!-- --- judging -------------------------------------------------------- -->
+  <div class="config-title spaced">Judgement</div>
+
+  <!-- Named explicitly for the same reason as the generator block: these
+       models come from a different service entirely, which is why none of the
+       generator's tags appear here. -->
+  <div class="backend-note">
+    <span class="dot {{ 'up' if credentials.judgment_key and credentials.judgment_url else 'down' }}"></span>
+    <span>
+      Served by the <strong>remote judgment API</strong>, not Ollama
+      {% if not (credentials.judgment_key and credentials.judgment_url) %}
+        &mdash; <strong>credentials missing.</strong> See
+        <code>api-key-judgment.txt</code>.
+      {% endif %}
+    </span>
+  </div>
+
+  <label class="field checkbox">
+    <input type="checkbox" id="do_judge" checked>
+    <span>Verify labels before detection</span>
+  </label>
+
+  <!-- Both model families are offered together. The backend is derived from
+       the model id by providers.provider_for_model(), so a Passau-hosted Qwen
+       and an Anthropic Claude can be mixed freely as Judge A and Judge B.
+       Anthropic entries are disabled when no key is present, rather than
+       failing once the run has started. -->
+  <label class="field">
+    <span class="field-label">Judge A</span>
+    <select id="judge_a">
+      <option value="">none</option>
+      <optgroup label="Judgment API">
+        {% for model, name in judgment_models.items() %}
+          <option value="{{ model }}"
+            {% if model == default_judge_a %}selected{% endif %}>{{ name }}</option>
+        {% endfor %}
+      </optgroup>
+      <optgroup label="Anthropic{% if not credentials.anthropic_key %} (no key){% endif %}">
+        {% for model, name in anthropic_models.items() %}
+          <option value="{{ model }}"
+            {% if not credentials.anthropic_key %}disabled{% endif %}>{{ name }}</option>
+        {% endfor %}
+      </optgroup>
+    </select>
+  </label>
+
+  <label class="field">
+    <span class="field-label">Judge B</span>
+    <select id="judge_b">
+      <option value="">none (single judge)</option>
+      <optgroup label="Judgment API">
+        {% for model, name in judgment_models.items() %}
+          <option value="{{ model }}"
+            {% if model == default_judge_b %}selected{% endif %}>{{ name }}</option>
+        {% endfor %}
+      </optgroup>
+      <optgroup label="Anthropic{% if not credentials.anthropic_key %} (no key){% endif %}">
+        {% for model, name in anthropic_models.items() %}
+          <option value="{{ model }}"
+            {% if not credentials.anthropic_key %}disabled{% endif %}>{{ name }}</option>
+        {% endfor %}
+      </optgroup>
+    </select>
+    <small>Two judges are shown side by side; a sample must satisfy both</small>
+  </label>
+
+  <!-- --- tools under test ----------------------------------------------- -->
+  <div class="config-title spaced">Tools under test</div>
+
+  {% for arm, entries in arms.items() %}
+    {% if entries %}
+      <div class="tool-group">
+        <div class="tool-group-title">{{ arm_names[arm] }}</div>
+        {% for entry in entries %}
+          <label class="field checkbox"
+                 title="{{ entry.blurb }}">
+            <input type="checkbox" class="tool-check" value="{{ entry.key }}"
+                   {% if entry.key in default_tools %}checked{% endif %}
+                   {% if not tool_status.get(entry.key) %}disabled{% endif %}>
+            <span class="{% if not tool_status.get(entry.key) %}muted{% endif %}">
+              {{ entry.name }}
+              {% if not tool_status.get(entry.key) %}(unavailable){% endif %}
+            </span>
+          </label>
+        {% endfor %}
+      </div>
+    {% endif %}
+  {% endfor %}
+
+  <label class="field">
+    <span class="field-label">LLM detector model(s)</span>
+    <select id="llm_models" multiple size="7">
+      <optgroup label="Judgment API">
+        {% for model, name in judgment_models.items() %}
+          <option value="{{ model }}"
+            {% if model == default_llm_detector %}selected{% endif %}>{{ name }}</option>
+        {% endfor %}
+      </optgroup>
+      <optgroup label="Anthropic{% if not credentials.anthropic_key %} (no key){% endif %}">
+        {% for model, name in anthropic_models.items() %}
+          <option value="{{ model }}"
+            {% if not credentials.anthropic_key %}disabled{% endif %}>{{ name }}</option>
+        {% endfor %}
+      </optgroup>
+    </select>
+    <small>
+      Ctrl-click for several; each becomes its own row in the comparison.
+      Keep these different from the judges.
+    </small>
+  </label>
+
+  <label class="field">
+    <span class="field-label">Run label</span>
+    <input type="text" id="label" placeholder="optional note">
+  </label>
+
+  <div class="actions">
+    <button id="run-btn" class="primary">Run pipeline</button>
+  </div>
+  <div id="run-note" class="note"></div>
+</div>
+{% endblock %}
+
+{% block content %}
+<header class="page-header">
+  <h1>New run</h1>
+  <p class="sub">
+    Generate a benchmark, verify its labels with independent judges, then run
+    the tool sets over what survives.
+  </p>
+</header>
+
+<!-- Live progress. The log is exactly the text the CLI prints, forwarded by
+     the on_progress callback, and also written to logs/&lt;run_id&gt;.log. -->
+<section class="card" id="progress-card" hidden>
+  <h2>Progress <span id="state-badge" class="badge"></span></h2>
+  <pre id="log" class="log"></pre>
+</section>
+
+<section class="card" id="results-card" hidden>
+  <h2>Results</h2>
+  <div id="dataset-summary" class="stats"></div>
+
+  <h3>Tool set comparison</h3>
+  <p class="hint" id="weights-note"></p>
+  <div class="scroll"><table id="ranking-table"></table></div>
+
+  <h3>Full metrics</h3>
+  <div class="scroll"><table id="metrics-table"></table></div>
+
+  <h3>Pairwise agreement</h3>
+  <p class="hint">
+    Cohen's kappa: 1.0 identical, 0.0 chance. Tools that agree strongly are
+    largely redundant; disagreement is where the comparison gets interesting.
+  </p>
+  <div class="scroll"><table id="agreement-table"></table></div>
+
+  <p class="hint">
+    <a id="detail-link" href="#">Open the full run page</a>
+    for per-sample verdicts, judge comparisons and source code.
+  </p>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+/* =====================================================================
+   Run page client.
+
+   Responsibilities:
+     - show and hide the configuration fields relevant to the chosen source
+     - POST the configuration, then poll until the job reaches a terminal state
+     - render a summary of the resulting report
+
+   All server state stays on the server; this file keeps only the poll timer,
+   so refreshing mid-run recovers the full log.
+   ===================================================================== */
+
+const POLL_INTERVAL_MS = 1000;
+let pollTimer = null;
+
+/* --- source-dependent fields ---------------------------------------- */
+
+function syncSourceFields() {
+  const source = document.getElementById('source').value;
+  document.getElementById('generate-fields').hidden = source !== 'generated';
+  document.getElementById('ingest-fields').hidden =
+    !(source === 'github' || source === 'local');
+  document.getElementById('existing-fields').hidden = source !== 'existing';
+
+  if (source === 'existing') loadExistingRuns();
+}
+
+async function loadExistingRuns() {
+  const select = document.getElementById('existing_run');
+  if (select.options.length > 0) return;            // already populated
+
+  const response = await fetch('/api/runs');
+  const data = await response.json();
+  for (const run of data.runs) {
+    const option = el('option', null,
+      `${run.run_id} (${run.verified_samples ?? run.generated_samples ?? 0} samples)`);
+    option.value = run.run_id;
+    select.append(option);
+  }
+}
+
+/* --- CWE chips ------------------------------------------------------- */
+
+document.getElementById('cwe-chips').addEventListener('click', (event) => {
+  const chip = event.target.closest('.chip');
+  if (chip) chip.classList.toggle('selected');
+});
+
+function selectedCwes() {
+  return Array.from(document.querySelectorAll('#cwe-chips .chip.selected'))
+              .map((chip) => chip.dataset.cwe);
+}
+
+/* --- starting a run --------------------------------------------------- */
+
+async function startRun() {
+  const button = document.getElementById('run-btn');
+  const note = document.getElementById('run-note');
+  button.disabled = true;
+  note.textContent = 'Starting...';
+
+  const judges = [
+    document.getElementById('judge_a').value,
+    document.getElementById('judge_b').value,
+  ].filter(Boolean);
+
+  const body = {
+    source: document.getElementById('source').value,
+    pairs: Number(document.getElementById('pairs').value),
+    generator_model: document.getElementById('generator_model').value,
+    cwe_selection: document.getElementById('cwe_selection').value,
+    cwe_subset: selectedCwes(),
+    seed: document.getElementById('seed').value,
+    do_judge: document.getElementById('do_judge').checked,
+    judge_models: judges,
+    tools: Array.from(document.querySelectorAll('.tool-check:checked'))
+                .map((box) => box.value),
+    llm_models: Array.from(document.getElementById('llm_models').selectedOptions)
+                     .map((option) => option.value),
+    ingest_source: document.getElementById('ingest_source').value,
+    max_files: Number(document.getElementById('max_files').value),
+    run_id: document.getElementById('existing_run').value,
+    label: document.getElementById('label').value,
+  };
+
+  const response = await fetch('/api/run', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    const data = await response.json();
+    note.textContent = data.error || 'Could not start the run.';
+    button.disabled = false;
+    return;
+  }
+
+  note.textContent = 'Running.';
+  document.getElementById('progress-card').hidden = false;
+  document.getElementById('results-card').hidden = true;
+  startPolling();
+}
+
+function startPolling() {
+  if (pollTimer) clearInterval(pollTimer);
+  pollStatus();                                     // immediate first poll
+  pollTimer = setInterval(pollStatus, POLL_INTERVAL_MS);
+}
+
+async function pollStatus() {
+  const response = await fetch('/api/status');
+  const data = await response.json();
+
+  const badge = document.getElementById('state-badge');
+  badge.textContent = data.state;
+  badge.className = 'badge ' + data.state;
+
+  const log = document.getElementById('log');
+  log.textContent = data.log.join('\n');
+  log.scrollTop = log.scrollHeight;                 // follow the tail
+
+  if (data.state === 'done' || data.state === 'error' || data.state === 'idle') {
+    clearInterval(pollTimer);
+    pollTimer = null;
+    document.getElementById('run-btn').disabled = false;
+    document.getElementById('run-note').textContent =
+      data.state === 'error' ? (data.error || 'Failed.') : 'Finished.';
+    if (data.state === 'done' && data.run_id) loadReport(data.run_id);
+  }
+}
+
+/* --- rendering the report --------------------------------------------- */
+
+async function loadReport(runId) {
+  const response = await fetch(`/api/runs/${encodeURIComponent(runId)}/report`);
+  if (!response.ok) return;                         // nothing scored yet
+  renderReport(await response.json(), runId);
+}
+
+function renderReport(report, runId) {
+  document.getElementById('results-card').hidden = false;
+  document.getElementById('detail-link').href = `/runs/${runId}`;
+
+  const dataset = report.dataset;
+  const summary = document.getElementById('dataset-summary');
+  summary.replaceChildren();
+  const facts = [
+    ['Run', dataset.run_id],
+    ['Scored samples', `${dataset.labelled_samples}`],
+    ['Vulnerable / safe', `${dataset.vulnerable} / ${dataset.safe}`],
+    ['CWE categories', `${dataset.cwes.length}`],
+    ['Generator', dataset.generator_model],
+  ];
+  if (dataset.generated_samples) {
+    facts.splice(2, 0, ['Dropped by judging',
+      `${dataset.dropped_by_judging ?? 0} of ${dataset.generated_samples}`]);
+  }
+  for (const [label, value] of facts) {
+    const box = el('div', 'stat');
+    box.append(el('span', 'stat-label', label), el('span', 'stat-value', value));
+    summary.append(box);
+  }
+
+  const weights = report.composite_weights;
+  document.getElementById('weights-note').textContent =
+    `composite = ${weights.f1}*F1 + ${weights.tnr}*(1-FPR) + ${weights.cwe}*CWE accuracy`;
+
+  buildTable(
+    document.getElementById('ranking-table'),
+    ['#', 'Detector', 'Arm', 'Composite', 'F1', 'MCC', 'FPR', 'CWE id.'],
+    report.ranking.map((row) => [
+      row.rank,
+      {text: row.name, className: 'strong'},
+      row.arm,
+      {text: fmt(row.composite), className: 'strong'},
+      fmt(row.f1), fmt(row.mcc), fmt(row.fpr), fmt(row.cwe_accuracy),
+    ]),
+  );
+
+  buildTable(
+    document.getElementById('metrics-table'),
+    ['Detector', 'TP', 'FP', 'TN', 'FN', 'Accuracy', 'Precision', 'Recall',
+     'F1', 'FPR', 'FNR', 'MCC', "Youden J", 'CWE id.'],
+    report.detectors.map((detector) => {
+      const m = detector.metrics;
+      return [
+        {text: detector.name, className: 'strong'},
+        m.tp, m.fp, m.tn, m.fn,
+        fmt(m.accuracy), fmt(m.precision), fmt(m.recall), fmt(m.f1),
+        fmt(m.fpr), fmt(m.fnr), fmt(m.mcc), fmt(m.youden_j),
+        fmt(m.cwe_accuracy),
+      ];
+    }),
+  );
+
+  buildTable(
+    document.getElementById('agreement-table'),
+    ['Detector A', 'Detector B', "Cohen's kappa", 'Raw agreement'],
+    report.agreement.map((pair) => [
+      pair.detector_a, pair.detector_b,
+      fmt(pair.kappa), fmt(pair.raw_agreement, 2),
+    ]),
+  );
+}
+
+/* --- startup ---------------------------------------------------------- */
+
+document.getElementById('run-btn').addEventListener('click', startRun);
+document.getElementById('source').addEventListener('change', syncSourceFields);
+syncSourceFields();
+
+/* Recover an in-flight run if the page was refreshed mid-job. */
+(async () => {
+  const response = await fetch('/api/status');
+  const data = await response.json();
+  const running = ['starting', 'generating', 'ingesting', 'judging',
+                   'detecting', 'evaluating'].includes(data.state);
+  if (running) {
+    document.getElementById('progress-card').hidden = false;
+    document.getElementById('run-btn').disabled = true;
+    startPolling();
+  } else if (data.state === 'done' && data.run_id) {
+    document.getElementById('progress-card').hidden = false;
+    document.getElementById('log').textContent = data.log.join('\n');
+    loadReport(data.run_id);
+  }
+})();
+</script>
+{% endblock %}

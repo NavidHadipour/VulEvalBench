@@ -1,0 +1,12 @@
+Copy this file to  api-key-judgment.txt  and fill in the two values.
+(api-key-judgment.txt is gitignored; this .example file is not.)
+
+Both values go in double quotes on their own line. The labels are free text --
+the loader identifies each value by its shape, not by the label above it:
+anything starting with http is the URL, anything starting with sk- is the key.
+
+URL:
+"https://your-openai-compatible-endpoint.example"
+
+api key:
+"sk-your-key-here"

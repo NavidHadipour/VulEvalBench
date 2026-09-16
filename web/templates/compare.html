@@ -1,0 +1,175 @@
+{% extends "base.html" %}
+{#
+  Cross-run comparison.
+
+  The per-run page answers "which tool won this run". This page answers the
+  question a thesis actually needs: does a tool's advantage hold up across
+  runs, or was it an artefact of one small sample?
+
+  At the dataset sizes this project currently produces, a single run's ranking
+  is noise -- one flipped verdict moves F1 by several points. Consistency
+  across runs is the only evidence worth reporting.
+#}
+
+{% block title %}Comparison &mdash; VulEvalBench{% endblock %}
+
+{% block content %}
+<header class="page-header">
+  <h1>Comparison</h1>
+  <p class="sub">
+    Every evaluated run, and how each tool set scored in it.
+  </p>
+</header>
+
+<section class="card">
+  <h2>Scoring method</h2>
+  <p class="hint">
+    Tools are ranked by a composite of three metrics, weighted as an explicit
+    editorial choice rather than a hidden formula:
+  </p>
+  <p class="formula">
+    composite =
+    {{ weights.f1 }} &times; F1 +
+    {{ weights.tnr }} &times; (1 &minus; FPR) +
+    {{ weights.cwe }} &times; CWE&nbsp;accuracy
+  </p>
+  <ul class="notes">
+    <li><strong>F1</strong> &mdash; overall quality on the vulnerable class.</li>
+    <li>
+      <strong>1 &minus; FPR</strong> &mdash; how far the tool can be trusted not
+      to cry wolf. A detector that flags everything scores well on recall and
+      is useless in practice; this term is what penalises it.
+    </li>
+    <li>
+      <strong>CWE accuracy</strong> &mdash; whether the tool understood
+      <em>what</em> the flaw was, not merely that something was wrong.
+    </li>
+  </ul>
+  <p class="hint">
+    The weights live in <code>config.COMPOSITE_WEIGHTS</code> and must sum to
+    1.0. Two further single-number summaries appear in the per-run tables:
+    <strong>MCC</strong>, a correlation over the whole confusion matrix that
+    cannot be inflated by always answering with the majority class, and
+    <strong>Youden's J</strong>, which balances the two error types
+    symmetrically.
+  </p>
+</section>
+
+<section class="card">
+  <h2>Mean score per tool, across runs</h2>
+  <p class="hint">
+    Averaged over every evaluated run in which the tool appeared. Read the run
+    count before reading the mean.
+  </p>
+  <div class="scroll"><table id="aggregate-table"></table></div>
+</section>
+
+<section class="card">
+  <h2>Per-run rankings</h2>
+  <div id="runs-container"></div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+/* =====================================================================
+   Comparison page client.
+
+   Aggregation happens here rather than on the server because it is a plain
+   mean over already-computed numbers; putting it in the browser keeps the
+   server's report files the single source of truth for the metrics
+   themselves.
+   ===================================================================== */
+
+async function loadComparison() {
+  const response = await fetch('/api/compare');
+  const data = await response.json();
+  const container = document.getElementById('runs-container');
+  container.replaceChildren();
+
+  if (!data.runs.length) {
+    container.append(el('p', 'hint',
+      'No evaluated runs yet. Run the pipeline with at least one tool '
+      + 'selected, and the comparison will appear here.'));
+    document.getElementById('aggregate-table').replaceChildren();
+    return;
+  }
+
+  /* --- aggregate: mean of each metric per detector, across runs ------- */
+  const totals = new Map();
+  for (const run of data.runs) {
+    for (const row of run.ranking) {
+      if (!totals.has(row.name)) {
+        totals.set(row.name, {
+          name: row.name, arm: row.arm, runs: 0,
+          composite: 0, f1: 0, mcc: 0, fpr: 0, cwe: 0,
+        });
+      }
+      const entry = totals.get(row.name);
+      entry.runs += 1;
+      entry.composite += row.composite;
+      entry.f1 += row.f1;
+      entry.mcc += row.mcc;
+      entry.fpr += row.fpr;
+      entry.cwe += row.cwe_accuracy;
+    }
+  }
+
+  const aggregated = Array.from(totals.values())
+    .map((entry) => ({
+      ...entry,
+      composite: entry.composite / entry.runs,
+      f1: entry.f1 / entry.runs,
+      mcc: entry.mcc / entry.runs,
+      fpr: entry.fpr / entry.runs,
+      cwe: entry.cwe / entry.runs,
+    }))
+    .sort((a, b) => b.composite - a.composite);
+
+  buildTable(
+    document.getElementById('aggregate-table'),
+    ['#', 'Detector', 'Arm', 'Runs', 'Mean composite', 'Mean F1',
+     'Mean MCC', 'Mean FPR', 'Mean CWE id.'],
+    aggregated.map((entry, index) => [
+      index + 1,
+      {text: entry.name, className: 'strong'},
+      entry.arm,
+      entry.runs,
+      {text: fmt(entry.composite), className: 'strong'},
+      fmt(entry.f1), fmt(entry.mcc), fmt(entry.fpr), fmt(entry.cwe),
+    ]),
+  );
+
+  /* --- one block per run ---------------------------------------------- */
+  for (const run of data.runs) {
+    const block = el('div', 'run-block');
+
+    const heading = el('h3');
+    const link = el('a', 'mono', run.run_id);
+    link.href = `/runs/${encodeURIComponent(run.run_id)}`;
+    heading.append(link);
+    heading.append(el('span', 'muted small',
+      `  ${run.source}, ${run.samples} scored samples`));
+    block.append(heading);
+
+    const table = el('table');
+    const wrap = el('div', 'scroll');
+    wrap.append(table);
+    block.append(wrap);
+    buildTable(table,
+      ['#', 'Detector', 'Arm', 'Composite', 'F1', 'MCC', 'FPR', 'CWE id.'],
+      run.ranking.map((row) => [
+        row.rank,
+        {text: row.name, className: 'strong'},
+        row.arm,
+        {text: fmt(row.composite), className: 'strong'},
+        fmt(row.f1), fmt(row.mcc), fmt(row.fpr), fmt(row.cwe_accuracy),
+      ]));
+
+    container.append(block);
+  }
+}
+
+loadComparison();
+</script>
+{% endblock %}

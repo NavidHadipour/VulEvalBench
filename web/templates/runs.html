@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{#
+  Previous runs.
+
+  This page exists because of the storage change the supervisor asked for:
+  runs are never overwritten, so every dataset ever generated stays reachable.
+  Each row links to the run's own page, where its samples, judge verdicts and
+  results can be inspected in full.
+#}
+
+{% block title %}Previous runs &mdash; VulEvalBench{% endblock %}
+
+{% block content %}
+<header class="page-header">
+  <h1>Previous runs</h1>
+  <p class="sub">
+    Every run is stored permanently under <code>runs/</code> and is never
+    overwritten. {{ runs|length }} run{{ '' if runs|length == 1 else 's' }} on
+    disk.
+  </p>
+</header>
+
+{% if not runs %}
+  <section class="card">
+    <p class="hint">
+      No runs yet. Start one from <a href="{{ url_for('page_index') }}">New
+      run</a>.
+    </p>
+  </section>
+{% else %}
+  <section class="card">
+    <div class="scroll">
+      <table class="runs-table">
+        <thead>
+          <tr>
+            <th>Run</th>
+            <th>Started</th>
+            <th>Source</th>
+            <th>Generator</th>
+            <th>Generated</th>
+            <th>Admitted</th>
+            <th>Tools</th>
+            <th>Status</th>
+            <th>Label</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for run in runs %}
+            <tr class="clickable"
+                onclick="window.location='{{ url_for('page_run_detail', run_id=run.run_id) }}'">
+              <td class="mono strong">{{ run.run_id }}</td>
+              <td class="mono small">{{ run.created_at[:19]|replace('T', ' ') }}</td>
+              <td>{{ run.source }}</td>
+              <td class="mono small">{{ run.generator_model or '-' }}</td>
+              <td>{{ run.generated_samples if run.generated_samples is not none else '-' }}</td>
+              <td>
+                {%- if run.verified_samples is not none -%}
+                  {{ run.verified_samples }}
+                  {%- if run.generated_samples %}
+                    <span class="muted small">
+                      ({{ (100 * run.verified_samples / run.generated_samples)|round|int }}%)
+                    </span>
+                  {%- endif -%}
+                {%- else -%}
+                  <span class="muted">not judged</span>
+                {%- endif -%}
+              </td>
+              <td>{{ run.detectors }}</td>
+              <td><span class="badge {{ run.status }}">{{ run.status }}</span></td>
+              <td class="small">{{ run.label or '' }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <h3>Reading this table</h3>
+    <ul class="notes">
+      <li>
+        <strong>Generated</strong> is how many samples the generator produced;
+        <strong>Admitted</strong> is how many survived judging. A low ratio
+        means the generator and the judges disagreed often, which usually
+        points at the generator model being too small for the task.
+      </li>
+      <li>
+        Runs whose source is <strong>github</strong> or <strong>local</strong>
+        hold real code with no ground-truth labels, so their reports omit
+        accuracy-style metrics and show tool agreement instead.
+      </li>
+    </ul>
+  </section>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,6 @@
+OPTIONAL. Copy this file to  api-key-llm.txt  only if you want to use Claude
+models as judges or LLM detectors. The pipeline runs fully without it.
+(api-key-llm.txt is gitignored; this .example file is not.)
+
+anthropic api key:
+"sk-ant-your-key-here"

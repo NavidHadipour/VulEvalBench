@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<!--
+  VulEvalBench -- shared page shell.
+
+  Every page extends this template, so the left sidebar is defined once. The
+  sidebar carries navigation, environment status, and (on the run page) the
+  entire configuration panel; the main column is left free for output, which is
+  what actually needs the width.
+
+  Deliberately dependency-free: no framework, no CDN, no build step. The whole
+  client is these templates plus static/style.css, so the container needs
+  nothing at run time beyond Python, and the interface works offline.
+
+  Blocks a child page may fill:
+    sidebar_extra  -- panels shown under the navigation (used by the run page)
+    content        -- the main column
+    scripts        -- page-specific JavaScript
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}VulEvalBench{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+
+<div class="layout">
+
+  <!-- ==================================================================
+       LEFT SIDEBAR
+       ================================================================== -->
+  <aside class="sidebar">
+
+    <div class="brand">
+      <span class="brand-name">VulEvalBench</span>
+      <span class="brand-sub">vulnerability detection benchmark</span>
+    </div>
+
+    <nav class="nav">
+      <a href="{{ url_for('page_index') }}"
+         class="nav-item {% if active_page == 'run' %}active{% endif %}">
+        New run
+      </a>
+      <a href="{{ url_for('page_runs') }}"
+         class="nav-item {% if active_page == 'runs' %}active{% endif %}">
+        Previous runs
+        <span class="count">{{ run_count }}</span>
+      </a>
+      <a href="{{ url_for('page_compare') }}"
+         class="nav-item {% if active_page == 'compare' %}active{% endif %}">
+        Comparison
+      </a>
+      <a href="{{ url_for('page_tools') }}"
+         class="nav-item {% if active_page == 'tools' %}active{% endif %}">
+        Tools
+      </a>
+    </nav>
+
+    {% block sidebar_extra %}{% endblock %}
+
+  </aside>
+
+  <!-- ==================================================================
+       MAIN COLUMN
+       ================================================================== -->
+  <main class="main">
+    {% block content %}{% endblock %}
+  </main>
+
+</div>
+
+<script>
+/* Shared helper, used by every page's script block.
+
+   Builds an element and sets its text via textContent, never innerHTML.
+   Generated samples, model reasoning and ingested source code are all
+   untrusted strings that reach these pages; assigning them as HTML would make
+   the viewer itself injectable -- an unfortunate flaw in a tool whose subject
+   is vulnerability detection. */
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined && text !== null) node.textContent = text;
+  return node;
+}
+
+/* Format a number to three decimals, tolerating null and undefined so a
+   partially-populated report cannot throw while rendering. */
+function fmt(value, places) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return '-';
+  return Number(value).toFixed(places === undefined ? 3 : places);
+}
+
+/* Build a table from a header list and an array of row-arrays. Cells may be
+   strings or {text, className} objects. Centralised so every table on every
+   page renders identically and safely. */
+function buildTable(target, headers, rows) {
+  target.replaceChildren();
+
+  const head = el('tr');
+  for (const header of headers) head.append(el('th', null, header));
+  const thead = el('thead');
+  thead.append(head);
+  target.append(thead);
+
+  const tbody = el('tbody');
+  for (const row of rows) {
+    const tr = el('tr');
+    for (const cell of row) {
+      if (cell && typeof cell === 'object') {
+        tr.append(el('td', cell.className, cell.text));
+      } else {
+        tr.append(el('td', null, cell));
+      }
+    }
+    tbody.append(tr);
+  }
+  target.append(tbody);
+}
+</script>
+
+{% block scripts %}{% endblock %}
+
+</body>
+</html>

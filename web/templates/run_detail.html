@@ -1,0 +1,323 @@
+{% extends "base.html" %}
+{#
+  One run, in full.
+
+  Three tabs over the same run:
+    Samples     every generated sample, whether it was admitted, and its source
+    Judgement   both judges' verdicts side by side, with the admission decision
+    Results     the scored comparison, if detection has been run
+
+  The side-by-side judgement view is the one the supervisor asked for
+  specifically, and it is usually the most informative view of a run: where two
+  judges disagree is exactly where the label was not trustworthy.
+#}
+
+{% block title %}{{ run_id }} &mdash; VulEvalBench{% endblock %}
+
+{% block content %}
+<header class="page-header">
+  <h1 class="mono">{{ run_id }}</h1>
+  <p class="sub">
+    {{ summary.source }} run &mdash;
+    {{ summary.generated_samples or 0 }} generated,
+    {% if summary.verified_samples is not none %}
+      {{ summary.verified_samples }} admitted after judging,
+    {% endif %}
+    {{ summary.detectors }} detector result{{ '' if summary.detectors == 1 else 's' }}.
+    {% if summary.label %}<em>{{ summary.label }}</em>{% endif %}
+  </p>
+</header>
+
+<div class="tabs">
+  <button class="tab active" data-tab="samples">Samples</button>
+  <button class="tab" data-tab="judgement">Judgement</button>
+  <button class="tab" data-tab="results">Results</button>
+</div>
+
+<!-- ================= SAMPLES ================= -->
+<section class="card tab-panel" id="tab-samples">
+  <h2>Samples</h2>
+  <p class="hint">
+    Select a row to view its source. Sample filenames are deliberately neutral
+    (<code>sample_007.py</code>) so that nothing a detector reads can reveal the
+    label; the descriptive metadata lives in the manifest and is joined in here
+    for display only.
+  </p>
+  <div class="scroll"><table id="samples-table"></table></div>
+</section>
+
+<!-- ================= JUDGEMENT ================= -->
+<section class="card tab-panel" id="tab-judgement" hidden>
+  <h2>Judgement &mdash; judges side by side</h2>
+  <p class="hint">
+    Each judge read every program cold, without being told the intended label.
+    A sample is admitted only when the judges' independent reading matches what
+    the generator intended. Rows highlighted in red were dropped.
+  </p>
+  <div id="judgement-summary" class="stats"></div>
+  <div class="scroll"><table id="judgement-table"></table></div>
+</section>
+
+<!-- ================= RESULTS ================= -->
+<section class="card tab-panel" id="tab-results" hidden>
+  <h2>Results</h2>
+  <div id="results-body">
+    <p class="hint">Loading&hellip;</p>
+  </div>
+</section>
+
+<!-- ================= SOURCE VIEWER ================= -->
+<section class="card" id="sample-card" hidden>
+  <h2>Source <span id="sample-title" class="mono"></span></h2>
+  <div id="sample-meta" class="stats"></div>
+  <p id="sample-note" class="note"></p>
+  <pre id="sample-code" class="code"></pre>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+/* =====================================================================
+   Run detail page client.
+
+   Everything is fetched from the run-scoped API endpoints, so this page
+   works for any run without server-side rendering of the data itself.
+   ===================================================================== */
+
+const RUN_ID = {{ run_id | tojson }};
+
+/* --- tabs ------------------------------------------------------------- */
+
+document.querySelectorAll('.tab').forEach((tab) => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach((t) => t.classList.remove('active'));
+    tab.classList.add('active');
+    for (const name of ['samples', 'judgement', 'results']) {
+      document.getElementById(`tab-${name}`).hidden = (name !== tab.dataset.tab);
+    }
+  });
+});
+
+/* --- samples ---------------------------------------------------------- */
+
+async function loadSamples() {
+  const response = await fetch(`/api/runs/${encodeURIComponent(RUN_ID)}/samples`);
+  if (!response.ok) return;
+  const data = await response.json();
+
+  const table = document.getElementById('samples-table');
+  const headers = ['Sample', 'Intended label', 'CWE', 'Difficulty', 'Context',
+                   'Admitted', 'Quality flags'];
+  table.replaceChildren();
+
+  const head = el('tr');
+  for (const header of headers) head.append(el('th', null, header));
+  const thead = el('thead');
+  thead.append(head);
+  table.append(thead);
+
+  const tbody = el('tbody');
+  for (const sample of data.samples) {
+    const row = el('tr', 'clickable' + (sample.admitted ? '' : ' dropped'));
+    row.append(el('td', 'mono', sample.id));
+
+    const isVulnerable = sample.label === 'vulnerable';
+    row.append(el('td', isVulnerable ? 'vuln' : (sample.label === 'unknown' ? 'muted' : 'safe'),
+                  sample.label));
+    row.append(el('td', 'mono', sample.cwe || '-'));
+    row.append(el('td', null, sample.difficulty || '-'));
+    row.append(el('td', 'small', sample.context || sample.origin_path || '-'));
+    row.append(el('td', sample.admitted ? 'ok' : 'bad',
+                  sample.admitted ? 'yes' : 'dropped'));
+    row.append(el('td', 'small muted',
+                  (sample.quality_flags || []).join(', ')));
+
+    row.addEventListener('click', () => showSample(sample.id));
+    tbody.append(row);
+  }
+  table.append(tbody);
+}
+
+/* --- judgement -------------------------------------------------------- */
+
+async function loadJudgement() {
+  const response = await fetch(`/api/runs/${encodeURIComponent(RUN_ID)}/judgement`);
+  const panel = document.getElementById('tab-judgement');
+
+  if (!response.ok) {
+    document.getElementById('judgement-table').replaceChildren();
+    panel.querySelector('.hint').textContent =
+      'This run has not been judged, so there is nothing to compare.';
+    return;
+  }
+
+  const data = await response.json();
+  const judges = data.judges.map((judge) => judge.model);
+
+  /* Summary: how often each judge agreed with the generator. */
+  const summary = document.getElementById('judgement-summary');
+  summary.replaceChildren();
+
+  const admitted = data.rows.filter((row) => row.admitted).length;
+  const facts = [['Consensus rule', data.consensus_rule],
+                 ['Admitted', `${admitted} / ${data.rows.length}`]];
+  for (const judge of data.judges) {
+    const agreed = data.rows.filter(
+      (row) => row.judges[judge.model] && row.judges[judge.model].agrees).length;
+    facts.push([judge.display_name, `${agreed} / ${data.rows.length} agreed`]);
+  }
+  for (const [label, value] of facts) {
+    const box = el('div', 'stat');
+    box.append(el('span', 'stat-label', label), el('span', 'stat-value', value));
+    summary.append(box);
+  }
+
+  /* One column pair per judge: their verdict, and why they were overruled. */
+  const headers = ['Sample', 'Intended', 'CWE'];
+  for (const judge of data.judges) {
+    headers.push(`${judge.display_name} verdict`, 'agrees?');
+  }
+  headers.push('Admitted');
+
+  const table = document.getElementById('judgement-table');
+  table.replaceChildren();
+  const head = el('tr');
+  for (const header of headers) head.append(el('th', null, header));
+  const thead = el('thead');
+  thead.append(head);
+  table.append(thead);
+
+  const tbody = el('tbody');
+  for (const row of data.rows) {
+    const tr = el('tr', row.admitted ? '' : 'dropped');
+    tr.append(el('td', 'mono', row.id));
+    tr.append(el('td', row.intended_label === 'vulnerable' ? 'vuln' : 'safe',
+                 row.intended_label));
+    tr.append(el('td', 'mono', row.intended_cwe || '-'));
+
+    for (const model of judges) {
+      const verdict = row.judges[model];
+      if (!verdict) {
+        tr.append(el('td', 'muted', '-'), el('td', 'muted', '-'));
+        continue;
+      }
+      const label = verdict.predicted_label || 'no answer';
+      const cwe = verdict.predicted_cwe ? ` ${verdict.predicted_cwe}` : '';
+      const confidence = verdict.confidence != null
+        ? ` (${fmt(verdict.confidence, 2)})` : '';
+      const cell = el('td', null, `${label}${cwe}${confidence}`);
+      cell.title = verdict.reasoning || '';
+      tr.append(cell);
+
+      tr.append(el('td', verdict.agrees ? 'ok' : 'bad',
+                   verdict.agrees ? 'yes' : (verdict.reasons || []).join(', ')));
+    }
+
+    tr.append(el('td', row.admitted ? 'ok' : 'bad',
+                 row.admitted ? 'admitted' : 'dropped'));
+    tbody.append(tr);
+  }
+  table.append(tbody);
+}
+
+/* --- results ---------------------------------------------------------- */
+
+async function loadResults() {
+  const body = document.getElementById('results-body');
+  const response = await fetch(`/api/runs/${encodeURIComponent(RUN_ID)}/report`);
+
+  if (!response.ok) {
+    body.replaceChildren(el('p', 'hint',
+      'No detector results for this run yet. Run the tools from the New run '
+      + 'page, choosing "Re-analyse a previous run".'));
+    return;
+  }
+
+  const report = await response.json();
+  body.replaceChildren();
+
+  const weights = report.composite_weights;
+  body.append(el('p', 'hint',
+    `composite = ${weights.f1}*F1 + ${weights.tnr}*(1-FPR) + ${weights.cwe}*CWE accuracy`));
+
+  const rankingTable = el('table');
+  body.append(el('h3', null, 'Tool set comparison'));
+  const rankingWrap = el('div', 'scroll');
+  rankingWrap.append(rankingTable);
+  body.append(rankingWrap);
+  buildTable(rankingTable,
+    ['#', 'Detector', 'Arm', 'Composite', 'F1', 'MCC', 'FPR', 'CWE id.'],
+    report.ranking.map((row) => [
+      row.rank, {text: row.name, className: 'strong'}, row.arm,
+      {text: fmt(row.composite), className: 'strong'},
+      fmt(row.f1), fmt(row.mcc), fmt(row.fpr), fmt(row.cwe_accuracy),
+    ]));
+
+  body.append(el('h3', null, 'Per-sample verdicts'));
+  const sampleTable = el('table');
+  const sampleWrap = el('div', 'scroll');
+  sampleWrap.append(sampleTable);
+  body.append(sampleWrap);
+
+  const headers = ['Sample', 'CWE', 'Truth'];
+  for (const detector of report.detectors) headers.push(detector.name);
+  buildTable(sampleTable, headers, report.samples.map((sample) => {
+    const row = [
+      {text: sample.id, className: 'mono'},
+      {text: sample.cwe || '-', className: 'mono'},
+      {text: sample.label,
+       className: sample.label === 'vulnerable' ? 'vuln' : 'safe'},
+    ];
+    for (const verdict of sample.verdicts) {
+      if (!verdict) { row.push('-'); continue; }
+      const guess = verdict.predicted_label === 'vulnerable' ? 'vuln' : 'safe';
+      row.push({
+        text: verdict.correct === null ? guess
+              : `${guess} ${verdict.correct ? 'OK' : 'WRONG'}`,
+        className: verdict.correct === null ? '' : (verdict.correct ? 'ok' : 'bad'),
+      });
+    }
+    return row;
+  }));
+}
+
+/* --- source viewer ---------------------------------------------------- */
+
+async function showSample(sampleId) {
+  const response = await fetch(
+    `/api/runs/${encodeURIComponent(RUN_ID)}/sample/${encodeURIComponent(sampleId)}`);
+  if (!response.ok) return;
+  const sample = await response.json();
+
+  document.getElementById('sample-card').hidden = false;
+  document.getElementById('sample-title').textContent = sample.id;
+
+  const meta = document.getElementById('sample-meta');
+  meta.replaceChildren();
+  const facts = [
+    ['Intended label', sample.label],
+    ['CWE', `${sample.cwe || '-'} ${sample.cwe_name || ''}`],
+    ['Difficulty', sample.difficulty || '-'],
+    ['Context', sample.context || '-'],
+    ['Pair', sample.pair_id || sample.origin_path || '-'],
+  ];
+  for (const [label, value] of facts) {
+    const box = el('div', 'stat');
+    box.append(el('span', 'stat-label', label), el('span', 'stat-value', value));
+    meta.append(box);
+  }
+
+  document.getElementById('sample-note').textContent = sample.note || '';
+  /* textContent, so the program is displayed and never executed or parsed
+     as markup by the browser. */
+  document.getElementById('sample-code').textContent = sample.code;
+  document.getElementById('sample-card').scrollIntoView({behavior: 'smooth'});
+}
+
+/* --- startup ---------------------------------------------------------- */
+
+loadSamples();
+loadJudgement();
+loadResults();
+</script>
+{% endblock %}
