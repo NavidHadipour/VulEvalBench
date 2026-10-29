@@ -79,6 +79,13 @@ LLM_KEY_FILES = [
     PROJECT_ROOT / "api-key-llm.txt",
     PROJECT_ROOT / "api-key-LLM.txt",
 ]
+# The TypeSafe endpoint, which serves the Jev System One model. A file of its
+# own rather than another entry in the LLM file: the key's prefix is not
+# documented, so it cannot be told apart from an OpenAI-style key by shape the
+# way _parse_credential_file() separates the others.
+TYPESAFE_KEY_FILES = [
+    PROJECT_ROOT / "api-key-typesafe.txt",
+]
 
 
 def ensure_dirs() -> None:
@@ -195,6 +202,26 @@ def load_anthropic_key() -> str | None:
     return _parse_credential_file(path).get("anthropic_key")
 
 
+def load_typesafe_key() -> str | None:
+    """Return the TypeSafe API key for Jev, or None if absent.
+
+    The whole file is the key, whether quoted or bare. Nothing is inferred
+    from a prefix, because TypeSafe does not document one -- so a key that
+    does not start with "sk-" is accepted exactly as given.
+
+    Returns None rather than raising: Jev is one optional judge among several,
+    and a run using the other judges must not be stopped by its absence.
+    """
+    path = _first_existing(TYPESAFE_KEY_FILES)
+    if path is None:
+        return None
+
+    text = path.read_text(encoding="utf-8").strip()
+    quoted = _QUOTED_RE.findall(text)
+    key = (quoted[0] if quoted else text).strip()
+    return key or None
+
+
 def credential_status() -> dict[str, bool]:
     """Report which credentials are available, for display in the web UI.
 
@@ -207,6 +234,7 @@ def credential_status() -> dict[str, bool]:
         "judgment_url": "base_url" in judgment,
         "judgment_key": "api_key" in judgment,
         "anthropic_key": load_anthropic_key() is not None,
+        "typesafe_key": load_typesafe_key() is not None,
     }
 
 

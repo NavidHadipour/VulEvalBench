@@ -263,6 +263,24 @@ button.primary {
 button.primary:hover:not(:disabled) { background: #78baff; }
 button.primary:disabled { background: #33445c; color: #7f8ea3; cursor: default; }
 
+/* The same button as .primary, in its stopping mode. Identical geometry so
+   the control does not move or resize when it changes meaning mid-run -- only
+   its colour and label change, which is what makes it read as the same
+   button rather than a new one appearing under the cursor. */
+button.danger {
+  width: 100%;
+  padding: .55rem;
+  background: var(--bad);
+  color: #1b0d0d;
+  border: none;
+  border-radius: var(--radius);
+  font-size: .9rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+button.danger:hover:not(:disabled) { background: #f58a8a; }
+button.danger:disabled { background: #5c3333; color: #a38787; cursor: default; }
+
 /* ---------------------------------------------------------------------
    Main column
    --------------------------------------------------------------------- */
@@ -435,6 +453,174 @@ td.safe { color: var(--ok); }
 .run-block { margin-bottom: 1.6rem; }
 .run-block h3 { margin-top: 0; text-transform: none; letter-spacing: 0;
                 font-size: .9rem; color: var(--text); }
+
+/* ---------------------------------------------------------------------
+   Collapsible sections
+
+   A results page carries the current table, one table per earlier detection
+   pass, and the baseline run a perturbed run came from. Expanded all at once
+   that is several screens of near-identical numbers and the one being read
+   gets lost, so each section folds and only the current results start open.
+
+   Built on <details>/<summary>: the open state is the browser's, so it
+   survives a re-render and needs no script.
+   --------------------------------------------------------------------- */
+
+.fold {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-input);
+  margin: .7rem 0;
+}
+
+.fold > summary {
+  cursor: pointer;
+  padding: .5rem .7rem;
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;          /* a long note wraps instead of overflowing */
+  gap: .5rem;
+  font-size: .9rem;
+  font-weight: 600;
+  /* The native marker is positioned differently in every browser, so it is
+     suppressed and replaced by a ::before that sits on the text baseline. */
+  list-style: none;
+}
+.fold > summary::-webkit-details-marker { display: none; }
+.fold > summary::before {
+  content: "\25B8";                                   /* closed */
+  color: var(--text-muted);
+  font-size: .78em;
+}
+.fold[open] > summary::before { content: "\25BE"; }   /* open */
+.fold > summary:hover { background: #1f2532; }
+.fold[open] > summary { border-bottom: 1px solid var(--border); }
+
+/* Secondary text on the summary line -- timestamp, sample count, the reason
+   a block is not comparable. It has to read while the section is closed,
+   since that is the state most sections are in. */
+.fold-note { font-weight: 400; font-size: .8rem; color: var(--text-muted); }
+
+.fold-body { padding: .1rem .7rem .7rem; }
+.fold-body > h3:first-child,
+.fold-body > p:first-child { margin-top: .7rem; }
+
+/* ---------------------------------------------------------------------
+   Manual sample review
+
+   Shown between generation and judging. Reuses .fold for the per-sample
+   disclosure, so a sample row looks like every other collapsible block in
+   the app; the additions here are the checkbox, the label pill and the
+   bulk-action buttons.
+   --------------------------------------------------------------------- */
+
+.selection-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .4rem;
+  margin: .8rem 0;
+}
+
+button.ghost {
+  padding: .3rem .6rem;
+  background: transparent;
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-size: .78rem;
+  cursor: pointer;
+}
+button.ghost:hover { background: #1f2532; color: var(--text); }
+
+/* Capped and scrolled: sixty rows would otherwise push the Continue button
+   below the fold, and the button is the whole point of the screen. */
+.selection-list {
+  max-height: 60vh;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: .3rem;
+}
+
+.sample-row { margin: .2rem 0; }
+.sample-row > summary { gap: .5rem; }
+.sample-check { margin: 0 .1rem 0 0; cursor: pointer; flex: none; }
+.sample-id { font-size: .8rem; flex: none; }
+
+/* The label is the one thing being decided, so it reads as a coloured pill
+   rather than more grey text. */
+.pill {
+  display: inline-block;
+  padding: .05rem .4rem;
+  border-radius: 3px;
+  font-size: .68rem;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  flex: none;
+}
+.pill-vuln { background: rgba(239,107,107,.16); color: var(--bad); }
+.pill-safe { background: rgba(78,201,138,.16); color: var(--ok); }
+/* The judges' decision, shown beside the label so an override is visible
+   as an override. Deliberately dimmer than the label pills: it is context
+   for the choice, not the thing being decided. */
+.pill-ok   { background: rgba(90,169,255,.14); color: var(--accent); }
+.pill-no   { background: #2a3140; color: var(--text-muted); }
+
+.verdict-line { margin: .3rem 0 .1rem; font-size: .8rem; }
+.verdict-line .ok  { color: var(--ok); }
+.verdict-line .bad { color: var(--bad); }
+
+/* Stage 2c, inside the review panel rather than the sidebar: the choice is
+   about the set the reviewer has just settled on, so it belongs beside it.
+   Inset and dimmer than the list above, because it is a follow-up question
+   and not part of keeping or dropping samples. */
+.balance-panel {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: .7rem .9rem .3rem;
+  margin: .9rem 0;
+  background: rgba(255, 255, 255, .015);
+}
+.balance-panel legend {
+  padding: 0 .4rem;
+  font-size: .78rem;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--text-muted);
+}
+.balance-panel .checkbox {
+  display: flex; align-items: center; gap: .45rem;
+  font-size: .85rem; margin: .1rem 0 .35rem; cursor: pointer;
+}
+.balance-panel .checkbox input { margin: 0; }
+#balance-composition { font-size: .82rem; margin: 0 0 .7rem; }
+
+.selection-submit { display: flex; align-items: center; gap: .6rem; }
+.selection-submit button.primary { width: auto; padding: .45rem 1.1rem; }
+.selection-submit .note { margin: 0; }
+
+.field-hint {
+  display: block;
+  margin: -.3rem 0 .9rem;
+  color: var(--text-muted);
+  font-size: .78rem;
+}
+
+.badge.selecting { background: rgba(240,180,90,.16); color: #f0b45a; }
+/* Terminal, like done and error, but neither success nor failure: the run did
+   what it was asked and then was asked to stop. */
+.badge.stopped { background: rgba(224,176,80,.14); color: var(--warn); }
+
+/* Sits in the Progress heading, so it is wherever the user is already looking
+   when they decide a run is too long. Deliberately not a primary button: it
+   is the exit, not the action. */
+.stop-btn {
+  float: right;
+  width: auto;
+  padding: .3rem .8rem;
+  font-size: .78rem;
+}
+.stop-btn:disabled { opacity: .5; cursor: default; }
 
 /* ---------------------------------------------------------------------
    Narrow screens

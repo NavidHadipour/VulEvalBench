@@ -55,6 +55,10 @@
          class="nav-item {% if active_page == 'tools' %}active{% endif %}">
         Tools
       </a>
+      <a href="{{ url_for('page_models') }}"
+         class="nav-item {% if active_page == 'models' %}active{% endif %}">
+        Models
+      </a>
     </nav>
 
     {% block sidebar_extra %}{% endblock %}
@@ -83,6 +87,26 @@ function el(tag, className, text) {
   if (className) node.className = className;
   if (text !== undefined && text !== null) node.textContent = text;
   return node;
+}
+
+/* A collapsible section, returning the element to fill.
+
+   Result pages stack several tables of the same shape -- this pass, each
+   earlier pass, the baseline run -- and showing them all expanded buries the
+   one being looked at. `note` is secondary text kept on the summary line so a
+   closed section still identifies itself; `open` is for the section that
+   matters now, normally only the current results. */
+function fold(host, title, note, open) {
+  const box = el('details', 'fold');
+  if (open) box.open = true;
+
+  const head = el('summary', null, title);
+  if (note) head.append(el('span', 'fold-note', note));
+
+  const body = el('div', 'fold-body');
+  box.append(head, body);
+  host.append(box);
+  return body;
 }
 
 /* Format a number to three decimals, tolerating null and undefined so a

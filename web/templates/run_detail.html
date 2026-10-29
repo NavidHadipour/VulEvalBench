@@ -4,7 +4,7 @@
 
   Three tabs over the same run:
     Samples     every generated sample, whether it was admitted, and its source
-    Judgement   both judges' verdicts side by side, with the admission decision
+    Judgement   every judge's verdict side by side, with the admission decision
     Results     the scored comparison, if detection has been run
 
   The side-by-side judgement view is the one the supervisor asked for
@@ -26,6 +26,15 @@
     {{ summary.detectors }} detector result{{ '' if summary.detectors == 1 else 's' }}.
     {% if summary.label %}<em>{{ summary.label }}</em>{% endif %}
   </p>
+  {% if summary.derived_from %}
+  <p class="sub">
+    <strong>Samples version {{ summary.version }}</strong> &mdash;
+    semantics-preserving rewrite of
+    <a class="mono" href="/runs/{{ summary.derived_from }}">{{ summary.derived_from }}</a>
+    &mdash; {{ summary.perturbations | join(', ') }}.
+    Compare the two to read the robustness result.
+  </p>
+  {% endif %}
 </header>
 
 <div class="tabs">
@@ -175,7 +184,11 @@ async function loadJudgement() {
   /* One column pair per judge: their verdict, and why they were overruled. */
   const headers = ['Sample', 'Intended', 'CWE'];
   for (const judge of data.judges) {
-    headers.push(`${judge.display_name} verdict`, 'agrees?');
+    // "typed" marks a System One judge: its confidence is a calibrated
+    // probability rather than a figure a chat model wrote, and hovering its
+    // cell shows those probabilities because there is no prose to show.
+    const kind = judge.kind === 'typed' ? ' [typed]' : '';
+    headers.push(`${judge.display_name}${kind} verdict`, 'agrees?');
   }
   headers.push('Admitted');
 
@@ -220,6 +233,75 @@ async function loadJudgement() {
   table.append(tbody);
 }
 
+const COMPARISON_COLUMNS = ['Detector', 'Arm', 'TP', 'FP', 'FN', 'TN', 'Accuracy', 'Precision',
+       'Recall', 'F1', 'FPR', 'FNR', 'MCC', "Youden J", 'CWE id.'];
+
+/* --- comparison blocks -------------------------------------------------
+   Renders one earlier result set beneath the current one, with a trailing
+   column giving the F1 change from it to now. Used for both a previous
+   detection pass over the same samples and the clean run a perturbed run was
+   derived from -- they differ only in the heading. */
+function appendComparisonTable(host, heading, subtitle, rows, currentByName) {
+  // Folded shut: the current pass is what is being read, and an earlier one
+  // is opened deliberately when the change is in question.
+  const block = fold(host, heading, subtitle, false);
+
+  const table = el('table');
+  const wrap = el('div', 'scroll');
+  wrap.append(table);
+  block.append(wrap);
+
+  buildTable(table,
+    COMPARISON_COLUMNS.concat(['F1 \u2192 now']),
+    rows.map((row) => {
+      const now = currentByName[row.name];
+      // A detector absent from the current pass has nothing to compare
+      // against; an em dash says so rather than implying a change of zero.
+      const delta = now ? fmt(now.f1 - row.f1) : '\u2014';
+      const cls = !now ? 'muted'
+        : (now.f1 - row.f1) < -0.001 ? 'wrong'
+        : (now.f1 - row.f1) > 0.001 ? 'ok' : 'muted';
+      return [
+        {text: row.name, className: 'strong'}, row.arm,
+        row.tp, row.fp, row.fn, row.tn,
+        fmt(row.accuracy), fmt(row.precision), fmt(row.recall),
+        fmt(row.f1), fmt(row.fpr), fmt(row.fnr), fmt(row.mcc),
+        fmt(row.youden_j), fmt(row.cwe_accuracy),
+        {text: delta, className: cls},
+      ];
+    }));
+}
+
+/* Everything earlier than the current pass, newest first, plus the run this
+   one was derived from when there is one. */
+function appendComparisons(host, report) {
+  const currentByName = {};
+  for (const row of report.ranking) currentByName[row.name] = row;
+
+  for (const entry of (report.rounds || [])) {
+    if (entry.is_current) continue;
+    // The round id ends in the local time the pass ran, so it is the
+    // timestamp shown; archived_at is UTC and would contradict it.
+    let subtitle = [entry.round_id, entry.label,
+                    `${entry.sample_count} samples`]
+      .filter(Boolean).join('  \u00b7  ');
+    if (entry.comparable === false) {
+      subtitle += '  \u2014  NOT directly comparable: scored on a different '
+                + 'admitted sample set, the run was re-judged in between.';
+    }
+    appendComparisonTable(host, 'Earlier pass', subtitle,
+                          entry.detectors, currentByName);
+  }
+
+  if (report.baseline) {
+    const b = report.baseline;
+    const subtitle = `${b.run_id}  \u00b7  clean samples, before `
+      + (b.perturbations || []).join(', ');
+    appendComparisonTable(host, 'Baseline run', subtitle,
+                          b.detectors, currentByName);
+  }
+}
+
 /* --- results ---------------------------------------------------------- */
 
 async function loadResults() {
@@ -236,28 +318,38 @@ async function loadResults() {
   const report = await response.json();
   body.replaceChildren();
 
-  const weights = report.composite_weights;
-  body.append(el('p', 'hint',
-    `composite = ${weights.f1}*F1 + ${weights.tnr}*(1-FPR) + ${weights.cwe}*CWE accuracy`));
-
+  // Open, because it is the reason the page was loaded. Everything below
+  // it starts closed so the page stays one screen until something is asked
+  // for -- a run can carry a table per earlier pass as well.
+  const current = fold(body, 'This pass',
+                       `${report.ranking.length} detectors`, true);
   const rankingTable = el('table');
-  body.append(el('h3', null, 'Tool set comparison'));
+  current.append(el('p', 'hint',
+    'Standard metrics per detector. Ordered by F1 for readability -- that is '
+    + 'a sort order, not a score, so read the whole row.'));
   const rankingWrap = el('div', 'scroll');
   rankingWrap.append(rankingTable);
-  body.append(rankingWrap);
+  current.append(rankingWrap);
   buildTable(rankingTable,
-    ['#', 'Detector', 'Arm', 'Composite', 'F1', 'MCC', 'FPR', 'CWE id.'],
+    ['Detector', 'Arm', 'TP', 'FP', 'FN', 'TN', 'Accuracy', 'Precision',
+     'Recall', 'F1', 'FPR', 'FNR', 'MCC', "Youden J", 'CWE id.'],
     report.ranking.map((row) => [
-      row.rank, {text: row.name, className: 'strong'}, row.arm,
-      {text: fmt(row.composite), className: 'strong'},
-      fmt(row.f1), fmt(row.mcc), fmt(row.fpr), fmt(row.cwe_accuracy),
+      {text: row.name, className: 'strong'}, row.arm,
+      row.tp, row.fp, row.fn, row.tn,
+      fmt(row.accuracy), fmt(row.precision), fmt(row.recall),
+      {text: fmt(row.f1), className: 'strong'},
+      fmt(row.fpr), fmt(row.fnr), fmt(row.mcc), fmt(row.youden_j),
+      fmt(row.cwe_accuracy),
     ]));
 
-  body.append(el('h3', null, 'Per-sample verdicts'));
+  appendComparisons(body, report);
+
+  const perSample = fold(body, 'Per-sample verdicts',
+                         `${report.samples.length} samples`, false);
   const sampleTable = el('table');
   const sampleWrap = el('div', 'scroll');
   sampleWrap.append(sampleTable);
-  body.append(sampleWrap);
+  perSample.append(sampleWrap);
 
   const headers = ['Sample', 'CWE', 'Truth'];
   for (const detector of report.detectors) headers.push(detector.name);

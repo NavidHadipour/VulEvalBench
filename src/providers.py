@@ -9,6 +9,21 @@ protocol:
     "passau"     OpenAI-compatible vLLM API   judging samples, LLM detection,
                                               text embeddings for the ML arm
     "anthropic"  Anthropic Messages API       optional second-vendor detector
+    "systemone"  TypeSafe /v1/systemone, and  judging samples with a typed,
+                 the local `laya` package     non-generative model
+
+THE FOURTH ONE IS NOT A CHAT BACKEND
+    `chat_json` covers the first three, because all three take a system prompt
+    and a user prompt and return text constrained to a JSON schema. System One
+    models do not: they take a `state` and a set of named typed questions, and
+    return a probability distribution per question. There is no prompt and no
+    generated text to parse.
+
+    So they get their own entry point, `decide_typed`, rather than being
+    disguised as chat models. A caller that wants a verdict from Jev or Laya
+    asks a different question in a different shape and gets calibrated
+    probabilities back -- which is the point of using them at all, and would be
+    thrown away by pretending the call was a chat completion.
 
 WHY WRAP THEM AT ALL
     Every stage of the pipeline wants the same thing: send a system prompt and
@@ -27,19 +42,25 @@ STRUCTURED OUTPUT IS NOT OPTIONAL HERE
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import re
+import warnings
 from dataclasses import dataclass, field
 
 import requests
 
 import config
-from common import load_anthropic_key, load_judgment_credentials
+from common import (
+    load_anthropic_key,
+    load_judgment_credentials,
+    load_typesafe_key,
+)
 
 # Providers understood by `chat_json`. Exposed as a constant so the web layer
 # can validate a browser-supplied provider name against it rather than
 # trusting the request body.
-PROVIDERS = ("ollama", "passau", "anthropic")
+PROVIDERS = ("ollama", "passau", "anthropic", "systemone")
 
 
 def provider_for_model(model: str) -> str:
@@ -62,8 +83,25 @@ def provider_for_model(model: str) -> str:
     Returns:
         One of `PROVIDERS`.
     """
+    # An installation's own registry wins, because it is an explicit
+    # declaration by whoever set this up and beats inference from the shape of
+    # an id. It is also the only way a self-hosted copy of a model whose name
+    # looks like someone else's can be routed correctly.
+    try:
+        from model_registry import provider_of
+
+        declared = provider_of(model)
+        if declared:
+            return declared
+    except Exception:                                        # noqa: BLE001
+        # A broken overlay must not break provider resolution for the
+        # shipped models.
+        pass
+
     if model in config.ANTHROPIC_MODELS:
         return "anthropic"
+    if model in config.SYSTEMONE_MODELS:
+        return "systemone"
     if model in config.JUDGMENT_MODELS:
         return "passau"
     if ":" in model:
@@ -555,6 +593,306 @@ def _chat_anthropic(model: str, system: str, user: str, schema: dict,
 
 
 # ---------------------------------------------------------------------------
+# System One: typed decisions instead of chat
+# ---------------------------------------------------------------------------
+# Wire format, identical for both models (TypeSafe document it; laya-serve
+# implements the same shape deliberately):
+#
+#   POST /v1/systemone
+#   {"model": ..., "state": <the text being judged>,
+#    "questions": {"<id>": {"type": "choice"|"score"|"noul", ...}}}
+#
+#   -> {"model": ..., "usage": {"input_tokens": n, "output_tokens": n},
+#       "answers": {"<id>": {"type": "choice", "choice": ...,
+#                            "confidence": 0-1, "probabilities": {...}}}}
+#
+# A `choice` question carries `criteria`: a map of option name to description,
+# up to 255 options. A `score` question carries `criteria` as an ordered list
+# of up to 10 level descriptions, the answer's `score` being the
+# probability-weighted expected level. A `noul` question needs no criteria and
+# answers with a single probability that the statement is true.
+
+
+@dataclass
+class TypedResult:
+    """One System One response, normalised across the hosted and local models.
+
+    Attributes:
+        answers: question id -> answer object, in the documented shape above.
+            Left as returned rather than flattened, because which fields are
+            present depends on the question type and the caller knows which it
+            asked.
+        input_tokens: prompt tokens reported by the backend, 0 if unreported.
+        output_tokens: as above. Jev bills input only; Laya is local and free.
+        model: the model version that actually answered, which for an alias
+            like `jev-latest` is more specific than what was requested and is
+            therefore what belongs in the run record.
+    """
+
+    answers: dict
+    input_tokens: int = 0
+    output_tokens: int = 0
+    model: str = ""
+
+
+def systemone_available(model: str) -> tuple[bool, str]:
+    """Report whether a System One model can be called, and why not if it cannot.
+
+    Returns a reason rather than raising, because this is called to decide what
+    to show in a dropdown. An unavailable model is offered but disabled, with
+    the reason beside it -- the alternative is a run that starts and then fails
+    on the first judgement call.
+
+    Args:
+        model: one of `config.SYSTEMONE_MODELS`.
+
+    Returns:
+        `(available, reason)`. `reason` is empty when available.
+    """
+    if model not in config.SYSTEMONE_MODELS:
+        return False, f"{model} is not a System One model"
+
+    if model in config.LAYA_CHECKPOINTS:
+        if importlib.util.find_spec("laya") is None:
+            return False, "the 'laya' package is not installed (pip install laya)"
+        return True, ""
+
+    if load_typesafe_key() is None:
+        return False, "no TypeSafe key in api-key-typesafe.txt"
+    return True, ""
+
+
+def _decide_jev(model: str, state: str, questions: dict,
+                timeout: int) -> TypedResult:
+    """Call the hosted TypeSafe endpoint."""
+    key = load_typesafe_key()
+    if not key:
+        raise ProviderError(
+            "No TypeSafe key found. Add it to api-key-typesafe.txt as:\n"
+            '"<your key>"\n'
+            "Jev is in early access; a key comes from the waitlist at "
+            "typesafe.ai."
+        )
+
+    try:
+        response = requests.post(
+            f"{config.TYPESAFE_BASE_URL}/v1/systemone",
+            headers={
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+            },
+            json={"model": model, "state": state, "questions": questions},
+            timeout=timeout,
+        )
+    except requests.RequestException as exc:
+        raise ProviderError(f"TypeSafe request failed: {exc}") from exc
+
+    if response.status_code != 200:
+        # The body carries the reason -- an unknown question type, a state over
+        # the context limit, an expired key -- and is far more useful than the
+        # status code alone.
+        raise ProviderError(
+            f"TypeSafe HTTP {response.status_code}: {response.text[:300]}"
+        )
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise ProviderError(
+            f"TypeSafe returned non-JSON: {response.text[:200]}"
+        ) from exc
+
+    answers = payload.get("answers")
+    if not isinstance(answers, dict) or not answers:
+        raise ProviderError(f"TypeSafe returned no answers: {str(payload)[:200]}")
+
+    usage = payload.get("usage") or {}
+    return TypedResult(
+        answers=answers,
+        input_tokens=int(usage.get("input_tokens", 0) or 0),
+        output_tokens=int(usage.get("output_tokens", 0) or 0),
+        model=payload.get("model", model),
+    )
+
+
+# One loaded Laya checkpoint per model id, kept for the life of the process.
+#
+# The checkpoint is a 0.4B encoder: loading it takes seconds and a few hundred
+# megabytes, and the judge calls it once per sample. Reloading per call would
+# dominate the stage's runtime -- the same mistake that made the ML arm's
+# availability check re-read an 8.6MB pickle on every page load.
+_LAYA_CACHE: dict[str, object] = {}
+
+# Warnings the checkpoint emitted while loading, per model id. Captured rather
+# than left on stderr: these are statements about how far its confidence can
+# be trusted, and a web run never shows stderr to anyone.
+_LAYA_NOTES: dict[str, list[str]] = {}
+
+
+def _laya_agent(model: str):
+    """Load, and then reuse, the local Laya checkpoint for `model`."""
+    if model in _LAYA_CACHE:
+        return _LAYA_CACHE[model]
+
+    try:
+        import laya
+    except ImportError as exc:
+        raise ProviderError(
+            "The 'laya' package is not installed: pip install laya"
+        ) from exc
+
+    checkpoint = config.LAYA_CHECKPOINTS[model]
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            agent = laya.load(checkpoint)
+    except Exception as exc:  # noqa: BLE001 - torch/HF raise many types
+        raise ProviderError(
+            f"Could not load Laya checkpoint {checkpoint}: {exc}"
+        ) from exc
+
+    _LAYA_NOTES[model] = [str(item.message) for item in caught]
+    _LAYA_CACHE[model] = agent
+    return agent
+
+
+def systemone_load_notes(model: str) -> list[str]:
+    """Warnings the model's checkpoint emitted when it was loaded.
+
+    Empty before the first call, because the checkpoint is loaded lazily, and
+    empty for the hosted model, which has no local checkpoint to complain.
+
+    Returns:
+        The warning texts, for a caller that will put them in the run log.
+    """
+    return list(_LAYA_NOTES.get(model, []))
+
+
+def _decide_laya(model: str, state: str, questions: dict) -> TypedResult:
+    """Run the local Laya checkpoint over one state.
+
+    Laya's Python API takes the same `(state, questions)` pair as the HTTP
+    protocol -- its own server implements TypeSafe's shape on top of this --
+    so the answers come back in the documented form and need no translation.
+    Only the container is normalised, since a local model reports no usage.
+    """
+    agent = _laya_agent(model)
+
+    try:
+        result = agent.predict(state, questions)
+    except Exception as exc:  # noqa: BLE001 - torch raises many types
+        raise ProviderError(f"Laya inference failed: {exc}") from exc
+
+    # The package returns either a plain dict or an object exposing one; both
+    # are accepted so a minor release that changes the wrapper does not break
+    # the judge.
+    if hasattr(result, "model_dump"):
+        payload = result.model_dump()
+    elif isinstance(result, dict):
+        payload = result
+    else:
+        payload = {"answers": getattr(result, "answers", None)}
+
+    answers = payload.get("answers", payload)
+    if not isinstance(answers, dict) or not answers:
+        raise ProviderError(f"Laya returned no answers: {str(payload)[:200]}")
+
+    return TypedResult(answers=answers, model=payload.get("model", model))
+
+
+def decide_typed(model: str, state: str, questions: dict,
+                 timeout: int = 90) -> TypedResult:
+    """Ask a System One model a set of typed questions about one state.
+
+    Args:
+        model: a key of `config.SYSTEMONE_MODELS`.
+        state: the content every question refers to -- here, one program.
+        questions: `{id: {"type": ..., ...}}` in the shape documented above.
+            At least one is required by the protocol.
+        timeout: seconds to wait on the hosted endpoint. Ignored for Laya,
+            which runs locally and cannot hang on a network.
+
+    Returns:
+        A `TypedResult`.
+
+    Raises:
+        ProviderError: on an unknown model, a missing key or package, a
+            transport failure, or a response carrying no answers.
+    """
+    if not questions:
+        raise ProviderError("decide_typed needs at least one question")
+
+    if model in config.LAYA_CHECKPOINTS:
+        return _decide_laya(model, state, questions)
+    if model in config.SYSTEMONE_MODELS:
+        return _decide_jev(model, state, questions, timeout)
+    raise ProviderError(f"Unknown System One model: {model}")
+
+
+def answer_confidence(answer: dict) -> float:
+    """How much probability the model put on the answer it gave, 0.0-1.0.
+
+    WHICH FIELD, AND WHY IT MATTERS
+        A System One answer can carry two different confidence numbers and
+        they are not interchangeable:
+
+            answer_confidence  max(p) -- the probability mass on the reported
+                               answer. Laya's own documentation calls this
+                               "the calibrated one, on every question type,
+                               so a caller can gate across types on a single
+                               number".
+            confidence         normalised Shannon entropy, 1 - H(p)/log(k):
+                               how concentrated the WHOLE distribution is.
+                               Its own docstring says it is "not calibrated:
+                               it is not what temperature scaling fits and
+                               not what the reported ECE measures".
+
+        The chat models report "how certain are you, 0-100", which is a
+        statement about the answer given -- so max(p) is the comparable
+        quantity and the entropy score is not. The difference decides runs:
+        on a real sample the label answer was P(not_vulnerable)=0.69, which
+        max(p) reports as 0.69 and the entropy score as 0.11. Against
+        JUDGE_MIN_CONFIDENCE = 0.60 the first is admitted and the second is
+        dropped as "low confidence" -- for a model that was not unsure at all.
+
+        So the preference order is: the backend's own calibrated field, then
+        max(p) computed from the distribution, and only then `confidence`.
+        Which branch runs depends on the backend, and both were checked:
+        Laya returns `answer_confidence` and takes the first; Jev's OpenAPI
+        schema has no such field, so it takes the second, which for a choice
+        answer is the same quantity. Neither reaches the third, and that is
+        the point of the order -- Jev documents its `confidence` as based on
+        how the probability is spread, which is the entropy-style measure
+        again, not the mass on the answer.
+
+    Used by both stages that consume a typed answer: judge.py, where it gates
+    admission, and detectors/llm_tools.py, where it becomes the detector's
+    reported confidence and is scored like any other tool's.
+
+    Args:
+        answer: one answer object from a System One response.
+
+    Returns:
+        A probability in 0.0-1.0, or 0.0 if the answer carries nothing usable.
+    """
+    value = answer.get("answer_confidence")
+    if isinstance(value, (int, float)):
+        return max(0.0, min(1.0, float(value)))
+
+    probabilities = answer.get("probabilities")
+    if isinstance(probabilities, dict) and probabilities:
+        numeric = [v for v in probabilities.values()
+                   if isinstance(v, (int, float))]
+        if numeric:
+            return max(0.0, min(1.0, float(max(numeric))))
+
+    value = answer.get("confidence")
+    if isinstance(value, (int, float)):
+        return max(0.0, min(1.0, float(value)))
+    return 0.0
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -589,6 +927,14 @@ def chat_json(provider: str, model: str, system: str, user: str,
         return _chat_passau(model, system, user, schema, max_tokens)
     if provider == "anthropic":
         return _chat_anthropic(model, system, user, schema, max_tokens)
+    if provider == "systemone":
+        # In PROVIDERS, but deliberately not reachable from here: these models
+        # generate no text, so there is no completion to constrain to a schema.
+        # Callers use decide_typed() and ask typed questions instead.
+        raise ProviderError(
+            f"{model} is a System One model and cannot answer a chat prompt. "
+            "Use decide_typed() with typed questions."
+        )
     raise ProviderError(
         f"Unknown provider {provider!r}; expected one of {PROVIDERS}."
     )

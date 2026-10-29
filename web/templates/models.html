@@ -1,0 +1,222 @@
+{% extends "base.html" %}
+
+{#
+  The model registry page.
+
+  The framework ships the models this thesis was measured with; it cannot ship
+  anyone else's endpoint or keys. This page is the browser face of
+  src/model_registry.py, writing the same gitignored models.local.json that
+  `python src/manage_models.py` does.
+
+  Two operations, and the difference matters:
+    - a model ADDED here can be deleted again;
+    - a SHIPPED model cannot be deleted, only hidden, so that an old run's
+      config_snapshot still resolves and a published number stays explicable.
+  The buttons say which applies.
+#}
+
+{% block title %}Models{% endblock %}
+
+{% block content %}
+<h1>Models</h1>
+
+<p class="lede">
+  Which models this installation can use, for each stage of the pipeline.
+  Shipped entries come from <code>config.py</code>; added entries live in
+  <code>{{ registry.file }}</code>, which is excluded from version control
+  because it names machine-specific endpoints and tags.
+</p>
+
+{% if messages %}
+  <div class="panel {% if errors %}panel-warn{% else %}panel-ok{% endif %}">
+    {% for message in messages %}<p>{{ message }}</p>{% endfor %}
+  </div>
+{% endif %}
+
+<h2>Available now</h2>
+
+{% for role, block in registry.roles.items() %}
+  {% if role != '_errors' %}
+  <div class="panel">
+    <h3>
+      {{ role }}
+      <span class="count">{{ block.available | length }}</span>
+    </h3>
+    <p class="hint">{{ role_help[role] }}</p>
+    {% if block.available %}
+      <table class="table">
+        <thead>
+          <tr><th>Model</th><th>Name</th><th>Source</th><th></th></tr>
+        </thead>
+        <tbody>
+        {% for model, name in block.available | dictsort %}
+          <tr>
+            <td><code>{{ model }}</code></td>
+            <td>{{ name if name != model else '' }}</td>
+            <td>
+              {% if model in block.added %}
+                <span class="pill">added</span>
+              {% else %}
+                <span class="pill pill-muted">shipped</span>
+              {% endif %}
+            </td>
+            <td>
+              <form method="post" class="inline-form">
+                <input type="hidden" name="action" value="remove">
+                <input type="hidden" name="id" value="{{ model }}">
+                <button type="submit" class="button-small">
+                  {% if model in block.added %}Delete{% else %}Hide{% endif %}
+                </button>
+              </form>
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="hint">Nothing available for this stage.</p>
+    {% endif %}
+  </div>
+  {% endif %}
+{% endfor %}
+
+{% if registry.disabled %}
+<h2>Hidden on this installation</h2>
+<div class="panel">
+  <p class="hint">
+    Shipped models are never deleted &mdash; hiding one keeps it resolvable
+    for runs that already used it, while removing it from every menu.
+  </p>
+  <table class="table">
+    <tbody>
+    {% for model in registry.disabled %}
+      <tr>
+        <td><code>{{ model }}</code></td>
+        <td>
+          <form method="post" class="inline-form">
+            <input type="hidden" name="action" value="enable">
+            <input type="hidden" name="id" value="{{ model }}">
+            <button type="submit" class="button-small">Show again</button>
+          </form>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+
+<h2>Add a model</h2>
+<div class="panel">
+  <form method="post">
+    <input type="hidden" name="action" value="add">
+
+    <label class="field">
+      <span class="field-label">Model id</span>
+      <input type="text" name="id" required
+             placeholder="qwen3-32b, or codellama:13b for a local tag">
+      <small>
+        Exactly as the backend expects it. No spaces, quotes or slashes
+        &mdash; it reaches a filename and a URL path.
+      </small>
+    </label>
+
+    <label class="field">
+      <span class="field-label">Display name</span>
+      <input type="text" name="name" placeholder="Qwen3 32B">
+      <small>Shown in menus and reports. Defaults to the id.</small>
+    </label>
+
+    <fieldset class="field">
+      <span class="field-label">Roles</span>
+      {% for role in roles %}
+        <label class="checkbox">
+          <input type="checkbox" name="roles" value="{{ role }}">
+          <span>{{ role }} &mdash; {{ role_help[role] }}</span>
+        </label>
+      {% endfor %}
+    </fieldset>
+
+    <label class="field">
+      <span class="field-label">Provider</span>
+      <select name="provider">
+        <option value="">(not needed for an ml model)</option>
+        {% for provider in api_providers %}
+          <option value="{{ provider }}">{{ provider }}</option>
+        {% endfor %}
+      </select>
+      <small>
+        Which backend serves it. Required for every role except
+        <code>ml</code>. A declared provider overrides the framework's guess,
+        which is what lets a self-hosted copy of a model be routed correctly.
+      </small>
+    </label>
+
+    <p class="hint">
+      The three fields below apply only to an <code>ml</code> model: a
+      pretrained word2vec&nbsp;+&nbsp;recurrent family loaded from a directory
+      under <code>models/</code>. They describe where the weights are, not a
+      new architecture &mdash; a model of a different shape needs a detector
+      module, not a registry entry.
+    </p>
+
+    <label class="field">
+      <span class="field-label">Weights directory</span>
+      <input type="text" name="directory" placeholder="my-lstm">
+      <small>Relative to <code>models/</code>.</small>
+    </label>
+
+    <label class="field">
+      <span class="field-label">word2vec filename</span>
+      <input type="text" name="word2vec"
+             placeholder="word2vec_withString10-100-200.model">
+    </label>
+
+    <label class="field">
+      <span class="field-label">Embedding dimensions</span>
+      <input type="number" name="dimensions" min="1" placeholder="200">
+      <small>
+        Must match what the weights were trained against. A mismatch does not
+        fail loudly &mdash; it feeds the network a representation it has never
+        seen and produces confident nonsense.
+      </small>
+    </label>
+
+    <label class="field">
+      <span class="field-label">Note or citation</span>
+      <input type="text" name="note" placeholder="optional">
+    </label>
+
+    <label class="field checkbox">
+      <input type="checkbox" name="replace" value="1">
+      <span>Overwrite an existing entry with this id</span>
+    </label>
+
+    <button type="submit" class="button">Add model</button>
+  </form>
+</div>
+
+<h2>Keys</h2>
+<div class="panel">
+  <p class="hint">
+    Keys are not stored here. They are read from <code>api-key-*.txt</code>
+    files beside the project, which version control excludes. A registered
+    model whose key file is missing stays listed and is reported as
+    unavailable, so a missing key reads as &ldquo;not configured&rdquo;
+    rather than the model appearing not to exist.
+  </p>
+  <table class="table">
+    <tbody>
+      {% for label, present in key_status %}
+      <tr>
+        <td>{{ label }}</td>
+        <td>
+          {% if present %}<span class="pill">present</span>
+          {% else %}<span class="pill pill-warn">missing</span>{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

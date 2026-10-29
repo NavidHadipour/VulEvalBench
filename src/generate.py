@@ -50,6 +50,7 @@ from __future__ import annotations
 import ast
 import random
 import re
+import sys
 
 import config
 import runstore
@@ -118,6 +119,34 @@ PAIR_SCHEMA = {
         "vulnerable_code", "safe_code",
         "vulnerability_explanation", "fix_summary",
     ],
+    "additionalProperties": False,
+}
+
+# The unpaired schema, used when config.GENERATE_TWINS is off. One program per
+# request instead of two, so the budget per sample is halved -- and so is the
+# evidence, since there is no counterpart to compare it against.
+#
+# The explanation field is required for BOTH labels, not only the vulnerable
+# one. On a safe sample it is the model stating what makes the operation safe,
+# which is the only thing the judge in stage 2 can check its reasoning
+# against: without a twin there is no diff to read the claim off.
+SINGLE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "code": {
+            "type": "string",
+            "description": "One complete Python program.",
+        },
+        "explanation": {
+            "type": "string",
+            "description": (
+                "One or two sentences. For a flawed program: where the flaw is "
+                "and how untrusted input reaches it. For a sound one: how the "
+                "same operation is performed without the flaw."
+            ),
+        },
+    },
+    "required": ["code", "explanation"],
     "additionalProperties": False,
 }
 
@@ -222,6 +251,103 @@ program uses:
 contain NO vulnerability of any kind. Applying the fix must genuinely close the
 hole: a change that only looks like the fix, without removing the attacker's
 control, is wrong.
+
+Invent the program yourself: choose the feature it implements, the function
+names and the surrounding logic. Do not reuse a textbook example.
+"""
+
+
+# UNPAIRED PROMPTS. Used when config.GENERATE_TWINS is off.
+#
+# Everything about leakage, realism and imports is carried over unchanged: a
+# single program can give its label away in a comment exactly as half of a
+# pair can, and `scrub_leaking_comments` still runs over it. What cannot be
+# carried over is the minimal-diff instruction, which has no meaning without
+# a counterpart -- and with it goes the only structural check that the two
+# classes are distinguishable by the flaw alone.
+SINGLE_SYSTEM_PROMPT = """You generate Python programs for an academic vulnerability-detection benchmark.
+
+Each request asks for ONE complete program. You will be told whether it must
+contain a specific security vulnerability or none at all.
+
+HARD REQUIREMENTS
+
+- When a vulnerability is requested: EXACTLY ONE, of the requested CWE
+  category and no other. It must be genuinely reachable from untrusted input
+  (a request parameter, a CLI argument, an environment value, a file read from
+  disk) and a real security defect, not a stylistic issue. Every other part of
+  the program must be written securely.
+- When no vulnerability is requested: the program must contain none at all,
+  of any category -- not merely not the one named. It must still perform the
+  same kind of real work, by the safe route.
+- The program must not hint at which kind it is. Never use words such as
+  vulnerable, insecure, unsafe, safe, secure, fixed, patched, sanitised,
+  sanitized, validated, exploit, injection, attack, malicious or dangerous in
+  ANY comment, docstring, string literal, function name or variable name. A
+  reader must be unable to tell without analysing the logic. This matters more
+  here than anywhere: the programs are read one at a time, so a single
+  revealing identifier is the whole answer.
+- Write realistic, idiomatic code that would pass casual review: real imports,
+  plausible surrounding logic, roughly 30 to 70 lines. Never a stub, a
+  placeholder, or a `print()` standing in for real work.
+- IMPORT EVERY MODULE AND NAME YOU USE, at the top. If the program calls
+  `pickle.load`, it must `import pickle`. A missing import makes the program
+  crash on its first call, and a program that cannot run is discarded.
+- Call your own functions with exactly the arguments they declare.
+- The program must be syntactically valid Python that could actually run.
+- Emit raw Python source only in the code field. No markdown fences, no prose.
+
+DIFFICULTY controls how obvious the flaw is, and on a sound program how far
+the untrusted input travels before it is handled correctly:
+- Easy    -- the call sits plainly in a short, direct path.
+- Medium  -- untrusted input passes through a helper or two before reaching it.
+- Hard    -- the input crosses several functions, with partial or incomplete
+             validation along the way.
+"""
+
+# Two user prompts, one per label.
+#
+# Both name the same CWE, and that is the point. The CWE fixes the SUBJECT --
+# a database query, a subprocess call, a deserialisation -- so the safe
+# population is about the same things as the vulnerable one. Asking for safe
+# programs without a topic would make the two classes separable by their
+# imports alone, which is a far easier problem than the one being measured.
+SINGLE_USER_PROMPT_VULNERABLE = """Generate one benchmark program that CONTAINS the vulnerability described below.
+
+CWE:          {cwe} ({cwe_name})
+Mechanism:    {hint}
+Context:      {context}
+Difficulty:   {difficulty}
+
+The program must begin with at least these imports, plus any others it uses:
+
+{context_imports}
+
+It must contain the flaw described under Mechanism, and no other flaw of any
+kind.
+
+Invent the program yourself: choose the feature it implements, the function
+names and the surrounding logic. Do not reuse a textbook example.
+"""
+
+SINGLE_USER_PROMPT_SAFE = """Generate one benchmark program that performs the operation below CORRECTLY,
+containing no security vulnerability of any kind.
+
+Operation:    the kind of work involved in {cwe} ({cwe_name})
+Mechanism to avoid: {hint}
+Correct approach:   {fix}
+Context:      {context}
+Difficulty:   {difficulty}
+
+The program must begin with at least these imports, plus any others it uses:
+
+{context_imports}
+
+It must do the same kind of real work as a program that would carry this flaw
+-- the same sort of query, call or parse -- by the correct route described
+under Correct approach. Do not sidestep the work to avoid the risk: a program
+that simply never performs the operation is not a sound version of it, and is
+rejected.
 
 Invent the program yourself: choose the feature it implements, the function
 names and the surrounding logic. Do not reuse a textbook example.
@@ -571,6 +697,48 @@ def check_pair(vulnerable: str, safe: str) -> list[str]:
     return flags
 
 
+def check_single(source: str) -> list[str]:
+    """Structurally validate one unpaired program.
+
+    The same checks as `check_pair`, minus the two that need a counterpart:
+    `identical_versions` and `length_mismatch` are not expressible on a single
+    program. That is not a gap in this function -- it is the cost of
+    generating without twins, and it is why the flag list a reviewer sees on
+    an unpaired run is shorter than on a paired one.
+
+    Args:
+        source: the program's source.
+
+    Returns:
+        A list of flag strings, empty when the program passed everything.
+        Flags carry no `_vulnerable`/`_safe` suffix here: there is only one
+        program, so there is nothing to disambiguate.
+    """
+    flags: list[str] = []
+
+    try:
+        ast.parse(source)
+    except SyntaxError as exc:
+        flags.append(f"syntax_error:line_{exc.lineno}")
+        # Everything below reads the AST or the text as code; on a file that
+        # does not parse their output would be noise, so stop here.
+        return flags
+
+    flags.extend(check_runtime_soundness(source))
+
+    leaked = find_leakage(source)
+    if leaked:
+        flags.append(f"leakage:{','.join(sorted(leaked))}")
+
+    line_count = len(source.splitlines())
+    if line_count < 12:
+        flags.append(f"too_short:{line_count}_lines")
+    elif line_count > 250:
+        flags.append(f"too_long:{line_count}_lines")
+
+    return flags
+
+
 # ---------------------------------------------------------------------------
 # Pipeline stage
 # ---------------------------------------------------------------------------
@@ -650,20 +818,268 @@ def _cwe_sequence(categories: list[str], n_pairs: int, selection: str,
     return sequence[:n_pairs]
 
 
+def _fatal_flags(flags: list[str]) -> list[str]:
+    """The flags that make a sample unusable rather than merely suspect.
+
+    One list, shared by the paired and unpaired paths, so the two cannot drift
+    into rejecting different things. `identical_versions` can only arise from
+    `check_pair` and is simply never present on an unpaired run.
+    """
+    return [
+        f for f in flags
+        if f.startswith(("syntax_error", "undefined_names", "call_arity",
+                         "call_keyword"))
+        or f == "identical_versions"
+    ]
+
+
+def _ask_generator(log, generator_model: str, index: int, unit: str,
+                   system: str, user: str, schema: dict,
+                   required: tuple[str, ...]) -> tuple[dict | None,
+                                                       dict | None, int, int]:
+    """One generation request, with the two failure modes a run must survive.
+
+    Both cost a long run everything if they are allowed to raise. A provider
+    error on one request must not destroy the forty that worked, and a
+    response truncated mid-object can come back missing a whole field --
+    reading that key directly once raised KeyError and aborted a fifty-pair
+    run at pair seven, losing every pair before it.
+
+    Args:
+        log: the run logger.
+        generator_model: Ollama model tag.
+        index: zero-based request number, for the rejection record.
+        unit: "pair" or "sample"; appears in the log line and as the index key
+            in the rejection record, so a rejected-requests file reads
+            correctly for the kind of run that produced it.
+        system: system prompt.
+        user: user prompt.
+        schema: grammar constraint passed to Ollama.
+        required: fields that must come back non-empty.
+
+    Returns:
+        `(data, rejection, in_tokens, out_tokens)`. Exactly one of `data` and
+        `rejection` is None. Tokens are returned even on a rejection: a
+        truncated response was paid for.
+    """
+    key = f"{unit}_index"
+    try:
+        result = chat_json(
+            provider="ollama",
+            model=generator_model,
+            system=system,
+            user=user,
+            schema=schema,
+            max_tokens=MAX_GENERATION_TOKENS,
+        )
+    except ProviderError as exc:
+        log.warning(f"      {unit} {index + 1} failed: {exc}")
+        return None, {
+            key: index + 1,
+            "reason": "provider_error", "detail": str(exc)[:500],
+        }, 0, 0
+
+    missing = [
+        field for field in required
+        if not (result.data.get(field) or "").strip()
+    ]
+    if missing:
+        truncated = result.data.get("__repaired__")
+        log.warning(
+            f"      rejected: incomplete response, missing "
+            f"{', '.join(missing)}"
+            + (" (response was truncated)" if truncated else "")
+        )
+        return None, {
+            key: index + 1,
+            "reason": "incomplete_response",
+            "missing_fields": missing,
+            "truncated": bool(truncated),
+        }, result.input_tokens, result.output_tokens
+
+    return result.data, None, result.input_tokens, result.output_tokens
+
+
+def _request_pair(log, generator_model: str, index: int,
+                  axes: dict) -> tuple[list[dict], dict | None, int, int]:
+    """Generate one vulnerable/safe pair.
+
+    Returns:
+        `(records, rejection, in_tokens, out_tokens)`. `records` holds the two
+        halves without ids -- naming happens after the shuffle in
+        `generate_dataset`, so that the file number cannot reveal the label.
+    """
+    cwe = axes["cwe"]
+    # MAX_GENERATION_TOKENS is sized for this path: one response carries two
+    # complete programs, and running out mid-answer truncates the second one.
+    data, rejection, in_tok, out_tok = _ask_generator(
+        log, generator_model, index, "pair",
+        SYSTEM_PROMPT,
+        USER_PROMPT.format(
+            cwe=cwe, cwe_name=axes["cwe_name"], hint=axes["hint"],
+            fix=config.CWE_FIXES.get(cwe, "remove the flaw at its root"),
+            context=axes["context"], difficulty=axes["difficulty"],
+            context_imports=required_imports(axes["context"], cwe),
+        ),
+        PAIR_SCHEMA,
+        ("vulnerable_code", "safe_code"),
+    )
+    if data is None:
+        return [], rejection, in_tok, out_tok
+
+    vulnerable = strip_fences(data["vulnerable_code"])
+    safe = strip_fences(data["safe_code"])
+
+    # --- repair what can be repaired ---------------------------------------
+    # Comments naming the label are removed before validation, since they
+    # carry no semantics and are the single commonest leak. Identifier leaks
+    # survive into the flags below for the judges to weigh.
+    vulnerable, scrubbed_v = scrub_leaking_comments(vulnerable)
+    safe, scrubbed_s = scrub_leaking_comments(safe)
+    if scrubbed_v or scrubbed_s:
+        log.info(
+            f"      scrubbed {scrubbed_v + scrubbed_s} label-revealing "
+            "comment(s)"
+        )
+
+    # --- validate ----------------------------------------------------------
+    flags = check_pair(vulnerable, safe)
+
+    # Fatal flags make a pair unusable, so it is discarded rather than sent to
+    # the judges. Code that cannot run is fatal for the same reason a syntax
+    # error is: the static analysers would parse a program that crashes on its
+    # first call, and the judges would (correctly) refuse to certify it --
+    # costing two judgment calls to reach the same verdict this check reaches
+    # for free. The remaining flags are recorded as quality warnings and the
+    # pair is kept, because the judge in stage 2 is a better arbiter of a
+    # borderline case than a line-count heuristic.
+    fatal = _fatal_flags(flags)
+    if fatal:
+        log.warning(f"      rejected: {', '.join(fatal)}")
+        return [], {
+            "pair_index": index + 1, "cwe": cwe,
+            "reason": "failed_checks", "flags": flags,
+        }, in_tok, out_tok
+
+    if flags:
+        log.info(f"      quality flags: {', '.join(flags)}")
+
+    # --- record both halves ------------------------------------------------
+    # `pair_id` links the two halves so later analysis can ask pair-level
+    # questions, e.g. "did the detector get BOTH versions right, or did it
+    # just label everything vulnerable?"
+    shared = {
+        "pair_id": f"pair_{index + 1:03d}",
+        "cwe": cwe,
+        "cwe_name": axes["cwe_name"],
+        "context": axes["context"],
+        "difficulty": axes["difficulty"],
+        "generator_model": generator_model,
+        "quality_flags": flags,
+    }
+    return [
+        {
+            **shared,
+            "label": config.LABEL_VULNERABLE,
+            "code": vulnerable,
+            "note": data["vulnerability_explanation"],
+        },
+        {
+            **shared,
+            "label": config.LABEL_SAFE,
+            "code": safe,
+            "note": data["fix_summary"],
+        },
+    ], None, in_tok, out_tok
+
+
+def _request_single(log, generator_model: str, index: int, axes: dict,
+                    want: str) -> tuple[list[dict], dict | None, int, int]:
+    """Generate one standalone program, with no twin.
+
+    Carries NO `pair_id`, and that absence is what every later stage reads to
+    know the sample has no control: balance.py counts it as an orphan, and the
+    review page's split-pair warning cannot fire on it because there is no
+    pair to split.
+
+    Args:
+        log: the run logger.
+        generator_model: Ollama model tag.
+        index: zero-based request number.
+        axes: this request's cwe, cwe_name, hint, context and difficulty.
+        want: `config.LABEL_VULNERABLE` or `config.LABEL_SAFE`; chooses the
+            prompt, and becomes the sample's ground-truth label.
+
+    Returns:
+        `(records, rejection, in_tokens, out_tokens)`, with one record.
+    """
+    cwe = axes["cwe"]
+    template = (SINGLE_USER_PROMPT_VULNERABLE
+                if want == config.LABEL_VULNERABLE
+                else SINGLE_USER_PROMPT_SAFE)
+
+    data, rejection, in_tok, out_tok = _ask_generator(
+        log, generator_model, index, "sample",
+        SINGLE_SYSTEM_PROMPT,
+        template.format(
+            cwe=cwe, cwe_name=axes["cwe_name"], hint=axes["hint"],
+            fix=config.CWE_FIXES.get(cwe, "remove the flaw at its root"),
+            context=axes["context"], difficulty=axes["difficulty"],
+            context_imports=required_imports(axes["context"], cwe),
+        ),
+        SINGLE_SCHEMA,
+        ("code", "explanation"),
+    )
+    if data is None:
+        return [], rejection, in_tok, out_tok
+
+    source = strip_fences(data["code"])
+    source, scrubbed = scrub_leaking_comments(source)
+    if scrubbed:
+        log.info(f"      scrubbed {scrubbed} label-revealing comment(s)")
+
+    flags = check_single(source)
+    fatal = _fatal_flags(flags)
+    if fatal:
+        log.warning(f"      rejected: {', '.join(fatal)}")
+        return [], {
+            "sample_index": index + 1, "cwe": cwe, "label": want,
+            "reason": "failed_checks", "flags": flags,
+        }, in_tok, out_tok
+
+    if flags:
+        log.info(f"      quality flags: {', '.join(flags)}")
+
+    return [{
+        "cwe": cwe,
+        "cwe_name": axes["cwe_name"],
+        "context": axes["context"],
+        "difficulty": axes["difficulty"],
+        "generator_model": generator_model,
+        "quality_flags": flags,
+        "label": want,
+        "code": source,
+        "note": data["explanation"],
+    }], None, in_tok, out_tok
+
+
 def generate_dataset(
     n_samples: int | None = None,
     seed: int | None = None,
     generator_model: str | None = None,
     cwe_selection: str | None = None,
     cwe_subset: list[str] | None = None,
+    twins: bool | None = None,
     label: str = "",
     on_progress=None,
+    should_stop=None,
 ) -> dict:
     """Generate a benchmark dataset into a fresh run directory.
 
     Args:
-        n_samples: total samples to produce; must be even, since samples come
-            in pairs. Defaults to `config.N_SAMPLES`.
+        n_samples: total samples to produce. Must be even when `twins` is
+            on, since samples then come in pairs; any count is accepted
+            without twins. Defaults to `config.N_SAMPLES`.
         seed: seeds axis sampling and the pre-naming shuffle, making the run
             *configuration* reproducible. Defaults to `config.SEED`; pass None
             explicitly for fresh randomness.
@@ -673,16 +1089,29 @@ def generate_dataset(
             trade-off between independent draws and guaranteed balance.
         cwe_subset: restrict generation to these CWE ids. Defaults to the full
             catalogue. Used by the web interface when a user ticks a subset.
+        twins: generate each sample together with its minimally-different
+            counterpart. Defaults to `config.GENERATE_TWINS`, which explains
+            what the alternative costs. Off, each sample is an independent
+            program asked for as vulnerable or as safe, the labels are dealt
+            out half and half, and no `pair_id` is written.
         label: free-text note stored in the run metadata.
         on_progress: callable taking one string; receives every log line.
+        should_stop: callable taking nothing, consulted before each request.
+            Once it returns True, generation stops and everything produced so
+            far is written as a smaller but complete dataset -- a run stopped
+            at request 40 of 1000 is a usable 40-request run, not a loss. It
+            is checked between requests rather than during one, because an
+            abandoned request would leave a half-read HTTP response behind.
 
     Returns:
         A summary dict including the new `run_id`, which the caller needs in
-        order to run any later stage against this dataset.
+        order to run any later stage against this dataset, and `stopped`:
+        True when `should_stop` cut the run short.
 
     Raises:
-        SystemExit: on an odd `n_samples` or an empty CWE subset -- both are
-            configuration errors, reported readably rather than as tracebacks.
+        SystemExit: on an odd `n_samples` with twins on, or an empty CWE
+            subset -- both are configuration errors, reported readably rather
+            than as tracebacks.
     """
     # `or` is deliberately not used for these defaults: n_samples=0 and seed=0
     # are falsy but legitimate, and would be silently replaced by the config
@@ -695,10 +1124,16 @@ def generate_dataset(
     cwe_selection = (
         config.CWE_SELECTION if cwe_selection is None else cwe_selection
     )
+    twins = config.GENERATE_TWINS if twins is None else bool(twins)
     categories = list(cwe_subset) if cwe_subset else list(config.CWE_CATEGORIES)
 
-    if n_samples % 2 != 0:
-        raise SystemExit("n_samples must be even: samples are generated in pairs.")
+    # The parity rule belongs to pairing, not to generation: without twins an
+    # odd count is a perfectly ordinary request.
+    if twins and n_samples % 2 != 0:
+        raise SystemExit(
+            "n_samples must be even: samples are generated in pairs. "
+            "Pass twins=False to generate unpaired samples instead."
+        )
     if not categories:
         raise SystemExit("No CWE categories selected; nothing to generate.")
 
@@ -713,6 +1148,11 @@ def generate_dataset(
             "generator_model": generator_model,
             "cwe_selection": cwe_selection,
             "cwe_categories": categories,
+            # Recorded because it changes what the dataset can support, not
+            # merely how it was built: a number measured on an unpaired run
+            # has no control behind it, and the snapshot is where a later
+            # reader finds that out.
+            "twins": twins,
         },
     )
     log = get_logger(run.run_id, on_progress)
@@ -722,165 +1162,114 @@ def generate_dataset(
     # other library that relies on global random state.
     rng = random.Random(seed)
 
-    n_pairs = n_samples // 2
-    cwe_sequence = _cwe_sequence(categories, n_pairs, cwe_selection, rng)
+    # One request per unit of work: a pair when twinned, a single program
+    # otherwise. Everything below counts in units, so the loop is the same
+    # either way.
+    units = n_samples // 2 if twins else n_samples
+    cwe_sequence = _cwe_sequence(categories, units, cwe_selection, rng)
+
+    # Which label each unpaired request asks for, dealt out half and half and
+    # then shuffled. Decided here rather than per request so the composition
+    # is exact rather than binomial: 11 samples give 6 vulnerable and 5 safe,
+    # not "about half" with a tail that can reach 9/2 on a small run. An
+    # intact paired run is 50/50 by construction and needs none of this.
+    labels: list[str] = []
+    if not twins:
+        labels = (
+            [config.LABEL_VULNERABLE] * ((units + 1) // 2)
+            + [config.LABEL_SAFE] * (units // 2)
+        )
+        rng.shuffle(labels)
+
     records: list[dict] = []
     rejected: list[dict] = []
     in_tokens = out_tokens = 0
 
     log.info(f"Run {run.run_id}")
-    log.info(
-        f"Generating {n_pairs} pairs ({n_samples} samples) with "
-        f"{generator_model} via Ollama"
-    )
+    if twins:
+        log.info(
+            f"Generating {units} pairs ({n_samples} samples) with "
+            f"{generator_model} via Ollama"
+        )
+    else:
+        log.info(
+            f"Generating {units} unpaired samples with {generator_model} "
+            "via Ollama"
+        )
+        log.warning(
+            "  Twins are off: each sample has no counterpart, so a verdict "
+            "cannot be attributed to the flaw rather than to the program. "
+            "See config.GENERATE_TWINS."
+        )
     log.info(
         f"CWE selection: {cwe_selection} over {len(categories)} categories"
     )
 
-    for index in range(n_pairs):
-        # --- choose this pair's axes ---------------------------------------
+    stopped = False
+    for index in range(units):
+        if should_stop is not None and should_stop():
+            stopped = True
+            log.warning(
+                f"  Stop requested; stopping after {index} of {units} "
+                f"request(s). What has been generated is kept."
+            )
+            break
+
+        # --- choose this request's axes ------------------------------------
         cwe = cwe_sequence[index]
 
         cwe_name = config.CWE_NAMES.get(cwe, cwe)
-        hint = config.CWE_HINTS.get(cwe, "")
-        context = rng.choice(config.CONTEXTS)
-        difficulty = rng.choice(config.DIFFICULTIES)
-
-        log.info(
-            f"  [{index + 1}/{n_pairs}] {cwe:<9} {difficulty:<7} {context}"
-        )
-
-        # --- ask the model -------------------------------------------------
-        # max_tokens is generous because one response carries two complete
-        # programs; running out mid-answer would truncate the second one.
-        try:
-            result = chat_json(
-                provider="ollama",
-                model=generator_model,
-                system=SYSTEM_PROMPT,
-                user=USER_PROMPT.format(
-                    cwe=cwe, cwe_name=cwe_name, hint=hint,
-                    fix=config.CWE_FIXES.get(cwe, "remove the flaw at its root"),
-                    context=context, difficulty=difficulty,
-                    context_imports=required_imports(context, cwe),
-                ),
-                schema=PAIR_SCHEMA,
-                max_tokens=MAX_GENERATION_TOKENS,
-            )
-        except ProviderError as exc:
-            # One failed pair must not destroy a long run: record it and move
-            # on, so a forty-pair generation survives a single bad response.
-            log.warning(f"      pair {index + 1} failed: {exc}")
-            rejected.append({
-                "pair_index": index + 1, "cwe": cwe,
-                "reason": "provider_error", "detail": str(exc)[:500],
-            })
-            continue
-
-        in_tokens += result.input_tokens
-        out_tokens += result.output_tokens
-
-        # A response truncated mid-object is salvaged by the provider's JSON
-        # repair, which can return a pair missing `safe_code` entirely. Reading
-        # that key directly raised KeyError and aborted a fifty-pair run at
-        # pair seven, losing every pair generated before it. A pair without
-        # both halves is simply unusable, so it is rejected like any other bad
-        # pair and the run continues.
-        missing = [
-            field for field in ("vulnerable_code", "safe_code")
-            if not (result.data.get(field) or "").strip()
-        ]
-        if missing:
-            truncated = result.data.get("__repaired__")
-            log.warning(
-                f"      rejected: incomplete response, missing "
-                f"{', '.join(missing)}"
-                + (" (response was truncated)" if truncated else "")
-            )
-            rejected.append({
-                "pair_index": index + 1, "cwe": cwe,
-                "reason": "incomplete_response",
-                "missing_fields": missing,
-                "truncated": bool(truncated),
-            })
-            continue
-
-        vulnerable = strip_fences(result.data["vulnerable_code"])
-        safe = strip_fences(result.data["safe_code"])
-
-        # --- repair what can be repaired -----------------------------------
-        # Comments naming the label are removed before validation, since they
-        # carry no semantics and are the single commonest leak. Identifier
-        # leaks survive into the flags below for the judges to weigh.
-        vulnerable, scrubbed_v = scrub_leaking_comments(vulnerable)
-        safe, scrubbed_s = scrub_leaking_comments(safe)
-        if scrubbed_v or scrubbed_s:
-            log.info(
-                f"      scrubbed {scrubbed_v + scrubbed_s} label-revealing "
-                "comment(s)"
-            )
-
-        # --- validate ------------------------------------------------------
-        flags = check_pair(vulnerable, safe)
-
-        # Syntax errors and identical twins make a pair unusable; the other
-        # flags are recorded as quality warnings but the pair is kept, because
-        # the judge in stage 2 is a better arbiter of borderline cases than a
-        # line-count heuristic.
-        # Fatal flags make a pair unusable, so it is discarded rather than
-        # sent to the judges. Code that cannot run is fatal for the same reason
-        # a syntax error is: the static analysers would parse a program that
-        # crashes on its first call, and the judges would (correctly) refuse to
-        # certify it -- costing two judgment calls to reach the same verdict
-        # this check reaches for free.
-        fatal = [
-            f for f in flags
-            if f.startswith(("syntax_error", "undefined_names", "call_arity",
-                             "call_keyword"))
-            or f == "identical_versions"
-        ]
-        if fatal:
-            log.warning(f"      rejected: {', '.join(fatal)}")
-            rejected.append({
-                "pair_index": index + 1, "cwe": cwe,
-                "reason": "failed_checks", "flags": flags,
-            })
-            continue
-
-        if flags:
-            log.info(f"      quality flags: {', '.join(flags)}")
-
-        # --- record both halves --------------------------------------------
-        # `pair_id` links the two halves so later analysis can ask pair-level
-        # questions, e.g. "did the detector get BOTH versions right, or did it
-        # just label everything vulnerable?"
-        pair_id = f"pair_{index + 1:03d}"
-        shared = {
-            "pair_id": pair_id,
+        axes = {
             "cwe": cwe,
             "cwe_name": cwe_name,
-            "context": context,
-            "difficulty": difficulty,
-            "generator_model": generator_model,
-            "quality_flags": flags,
+            "hint": config.CWE_HINTS.get(cwe, ""),
+            "context": rng.choice(config.CONTEXTS),
+            "difficulty": rng.choice(config.DIFFICULTIES),
         }
-        records.append({
-            **shared,
-            "label": config.LABEL_VULNERABLE,
-            "code": vulnerable,
-            "note": result.data["vulnerability_explanation"],
-        })
-        records.append({
-            **shared,
-            "label": config.LABEL_SAFE,
-            "code": safe,
-            "note": result.data["fix_summary"],
-        })
 
-    if not records:
-        run.update_metadata(status="failed", error="No usable pairs generated.")
+        if twins:
+            log.info(
+                f"  [{index + 1}/{units}] {cwe:<9} "
+                f"{axes['difficulty']:<7} {axes['context']}"
+            )
+            new, rejection, in_tok, out_tok = _request_pair(
+                log, generator_model, index, axes
+            )
+        else:
+            # The label is decided before the request, not after, because it
+            # chooses which prompt is sent. `labels` was built and shuffled
+            # from the seeded rng, so the sequence is reproducible.
+            want = labels[index]
+            log.info(
+                f"  [{index + 1}/{units}] {cwe:<9} "
+                f"{axes['difficulty']:<7} {axes['context']}  ({want})"
+            )
+            new, rejection, in_tok, out_tok = _request_single(
+                log, generator_model, index, axes, want
+            )
+
+        in_tokens += in_tok
+        out_tokens += out_tok
+        if rejection is not None:
+            rejected.append(rejection)
+            continue
+        records.extend(new)
+
+    unit = "pair" if twins else "sample"
+    if not records and stopped:
+        # Distinguished from the failure below, because nothing is wrong: the
+        # user stopped the run before the first usable result.
+        run.update_metadata(status="stopped", error=None)
         raise SystemExit(
-            "Generation produced no usable pairs. Check logs/"
+            "Stopped before any sample was generated; nothing was written "
+            f"for {run.run_id}."
+        )
+    if not records:
+        run.update_metadata(
+            status="failed", error=f"No usable {unit}s generated."
+        )
+        raise SystemExit(
+            f"Generation produced no usable {unit}s. Check logs/"
             f"{run.run_id}.log -- the most common causes are the Ollama server "
             "not running and the model tag not being pulled."
         )
@@ -890,6 +1279,11 @@ def generate_dataset(
     # sample_001/sample_002 would always be a vulnerable/safe pair, so the file
     # number and the directory order would both reveal the label to anyone --
     # or anything -- listing the directory.
+    #
+    # It runs on an unpaired run too. The labels were dealt out and shuffled
+    # before generation, so the order is already not alternating, but the
+    # requests were still issued in that order and a reader who knows the seed
+    # could reconstruct it from the sequence alone.
     rng.shuffle(records)
 
     manifest: list[dict] = []
@@ -923,29 +1317,53 @@ def generate_dataset(
         )
 
     run.update_metadata(
-        status="generated",
+        # "stopped" rather than "generated" when the run was cut short: the
+        # dataset is sound, but it is not the dataset that was requested, and
+        # the run listing should not imply otherwise.
+        status="stopped" if stopped else "generated",
+        stopped_early=stopped,
+        requested_samples=n_samples,
         generator_model=generator_model,
         generated_samples=len(manifest),
-        generated_pairs=len(manifest) // 2,
+        # Counted from the records rather than divided out of the total: on an
+        # unpaired run there are no pairs at all, and reporting len/2 would
+        # invent 5 pairs out of 10 unrelated programs.
+        generated_pairs=(len(manifest) // 2) if twins else 0,
+        paired=twins,
         rejected_pairs=len(rejected),
         cwes_present=cwes_present,
         tokens={"input": in_tokens, "output": out_tokens},
     )
 
     log.info(f"Wrote {len(manifest)} samples to {run.samples_dir}")
+    if stopped:
+        log.warning(
+            f"  Stopped early: {len(manifest)} of the {n_samples} sample(s) "
+            "asked for. The run is complete and usable at this size."
+        )
     log.info(
         f"Composition: {vulnerable_count} vulnerable / "
         f"{len(manifest) - vulnerable_count} safe, "
         f"{len(cwes_present)} CWE categories present"
     )
+    if not twins:
+        log.info(
+            "  Unpaired: no sample has a counterpart, so pair-level analysis "
+            "and the localisation ground truth a diff would give are both "
+            "unavailable on this run."
+        )
     if rejected:
-        log.info(f"Rejected {len(rejected)} pair(s); see generation_rejected.json")
+        log.info(
+            f"Rejected {len(rejected)} {unit}(s); see generation_rejected.json"
+        )
     log.info(f"Tokens: {in_tokens} in, {out_tokens} out")
 
     return {
         "run_id": run.run_id,
         "samples": len(manifest),
-        "pairs": len(manifest) // 2,
+        "pairs": (len(manifest) // 2) if twins else 0,
+        "paired": twins,
+        "stopped": stopped,
         "rejected": len(rejected),
         "generator_model": generator_model,
         "cwes_present": cwes_present,
@@ -958,8 +1376,25 @@ def generate_dataset(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    """Run generation with the settings in config.py, printing progress."""
-    summary = generate_dataset(on_progress=print)
+    """Usage: python src/generate.py [--twins | --no-twins] [N]
+
+    Everything else comes from config.py. The two flags override
+    `config.GENERATE_TWINS` for one run without editing the file, so the
+    committed defaults stay the reproducible ones.
+    """
+    args = sys.argv[1:]
+    twins = None
+    if "--no-twins" in args:
+        twins = False
+    elif "--twins" in args:
+        twins = True
+
+    counts = [a for a in args if a.isdigit()]
+    n_samples = int(counts[0]) if counts else None
+
+    summary = generate_dataset(
+        n_samples=n_samples, twins=twins, on_progress=print
+    )
     print(f"\nRun id: {summary['run_id']}")
 
 

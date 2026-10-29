@@ -13,6 +13,8 @@ WHAT IS CHECKED, AND WHY EACH ONE MATTERS
     Python version      the code uses `match`-free 3.10+ syntax (X | Y unions).
     Python packages     each detector arm needs its own libraries; a missing
                         one disables that arm silently at run time.
+    Pretrained weights  the ML arm runs published models that are downloaded
+                        rather than installed; without them that arm is dead.
     Static analysers    Bandit, Ruff and Semgrep are executables installed into
                         the virtualenv; pip reports success even when semgrep
                         installs no runnable binary on old versions.
@@ -65,9 +67,12 @@ def check_packages() -> None:
         "sklearn": "pip install scikit-learn",
         "numpy": "pip install numpy",
         "pyflakes": "pip install pyflakes",
+        "tf_keras": "pip install tensorflow-cpu tf-keras   (pretrained ML arm)",
     }
     optional = {
         "anthropic": "only needed for Claude models: pip install anthropic",
+        "laya": "only needed for the Laya typed model, as judge or "
+                "detector: pip install laya",
     }
     for module, fix in required.items():
         try:
@@ -103,7 +108,7 @@ def check_static_tools() -> None:
 
 
 def check_credentials() -> None:
-    """Confirm the judgment API URL and key were found; Anthropic is optional."""
+    """Confirm the judgment API URL and key were found; the rest are optional."""
     import common
     status = common.credential_status()
     if status["judgment_url"] and status["judgment_key"]:
@@ -118,6 +123,13 @@ def check_credentials() -> None:
     else:
         report(WARN, "credentials: Anthropic",
                "not set; Claude models unavailable (optional)")
+    if status["typesafe_key"]:
+        report(OK, "credentials: TypeSafe (Jev)", "(optional)")
+    else:
+        report(WARN, "credentials: TypeSafe (Jev)",
+               "not set; Jev is unavailable as a judge and as a detector. "
+               "Jev is in early access -- put the key in "
+               "api-key-typesafe.txt (optional)")
 
 
 def check_ollama() -> None:
@@ -139,6 +151,46 @@ def check_ollama() -> None:
                f"'{config.GENERATOR_MODEL}' not pulled -- run: "
                f"ollama pull {config.GENERATOR_MODEL}"
                + (f"   (pulled: {', '.join(models)})" if models else ""))
+
+
+def check_pretrained_models() -> None:
+    """Confirm the downloaded ML weights are present and loadable.
+
+    Reported per family. `ml_vudenc` is expected to fail on most machines --
+    its embedding array was never published -- so it is a warning rather than
+    a failure: the arm still runs with the Passau model alone.
+    """
+    import config
+    from common import MODELS_DIR
+
+    try:
+        from detectors.ml_models import family_available
+    except Exception as exc:  # noqa: BLE001
+        report(FAIL, "pretrained ML models", f"cannot import detector: {exc}")
+        return
+
+    if family_available("ml_farasat"):
+        report(OK, "pretrained: BiLSTM (Passau)",
+               str(MODELS_DIR / config.VUDENC_FARASAT_DIR))
+    else:
+        report(FAIL, "pretrained: BiLSTM (Passau)",
+               "weights missing -- run: python src/fetch_models.py")
+
+    if config.VUDENC_USE_FARASAT_WEIGHTS:
+        # Reporting "ok" against the VUDENC directory would be a lie: the slot
+        # loads Farasat's files and duplicates the detector above it.
+        report(WARN, "pretrained: LSTM (VUDENC)",
+               "SUBSTITUTED -- running on Farasat's weights and word2vec "
+               f"from {MODELS_DIR / config.VUDENC_FARASAT_DIR}. Duplicates "
+               "ml_farasat; not a VUDENC measurement. Set "
+               "VUDENC_USE_FARASAT_WEIGHTS = False to restore the real check")
+    elif family_available("ml_vudenc"):
+        report(OK, "pretrained: LSTM (VUDENC)",
+               str(MODELS_DIR / config.VUDENC_ORIGINAL_DIR))
+    else:
+        report(WARN, "pretrained: LSTM (VUDENC)",
+               "unavailable -- its word2vec vector array was never published "
+               "by the authors; see src/fetch_models.py (expected)")
 
 
 def check_cwe_hierarchy() -> None:
@@ -173,8 +225,8 @@ def check_writable() -> None:
 def main() -> int:
     """Run every check, print the checklist, and return 0 only if none failed."""
     for check in (check_python, check_packages, check_static_tools,
-                  check_credentials, check_ollama, check_cwe_hierarchy,
-                  check_writable):
+                  check_credentials, check_ollama, check_pretrained_models,
+                  check_cwe_hierarchy, check_writable):
         try:
             check()
         except Exception as exc:  # noqa: BLE001 - one broken check must not hide the rest

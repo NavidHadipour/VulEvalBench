@@ -36,6 +36,7 @@
             <th>Run</th>
             <th>Started</th>
             <th>Source</th>
+            <th>From</th>
             <th>Generator</th>
             <th>Generated</th>
             <th>Admitted</th>
@@ -51,6 +52,12 @@
               <td class="mono strong">{{ run.run_id }}</td>
               <td class="mono small">{{ run.created_at[:19]|replace('T', ' ') }}</td>
               <td>{{ run.source }}</td>
+              <!-- Only a derived run has a parent. Shown as its own column so
+                   a v2.0/v3.0 id can be traced to the samples it came from
+                   without opening the run. -->
+              <td class="mono small">
+                {%- if run.derived_from -%}{{ run.derived_from }}{%- else -%}&mdash;{%- endif -%}
+              </td>
               <td class="mono small">{{ run.generator_model or '-' }}</td>
               <td>{{ run.generated_samples if run.generated_samples is not none else '-' }}</td>
               <td>

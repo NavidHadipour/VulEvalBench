@@ -17,6 +17,22 @@ CONVENTION
     vulnerability (a security failure).
 
 THE COMPARISON MATHEMATICS
+    LOCALISATION -- only where the ground truth records it
+        A sample may carry `vulnerable_lines`, the 1-based lines known to hold
+        the flaw, and a detector may answer with `predicted_lines`. Where both
+        exist, true positives are also scored on whether the detector pointed
+        within config.LOCALISATION_TOLERANCE_LINES of a real one.
+
+        This matters as soon as real code is scored. On a 40-line generated
+        program built around one planted flaw, "is this file vulnerable" and
+        "where is the flaw" are the same question. On a 150-line file from a
+        real repository where two lines are wrong, they are not, and a
+        file-level verdict alone cannot tell a tool that found the bug from
+        one that flagged an unrelated line and was counted correct.
+
+        Runs without line-level truth -- every generated run -- report
+        `localisable: 0` and the block is skipped rather than scored as zero.
+
     Four layers, from most standard to most specific to this project:
 
     1. Confusion matrix and the usual rates -- accuracy, precision, recall,
@@ -34,18 +50,38 @@ THE COMPARISON MATHEMATICS
            chance. Reads as "how much better than guessing", balancing the two
            error types symmetrically.
 
-    3. A composite score, defined in config.COMPOSITE_WEIGHTS as an explicit
-       weighted sum:
+    3. NO SINGLE COMBINED SCORE.
 
-           composite = w_f1 * F1 + w_tnr * (1 - FPR) + w_cwe * CWE_accuracy
+       An earlier version ranked detectors by a weighted sum of F1, (1-FPR)
+       and CWE accuracy. That has been removed deliberately. Collapsing three
+       different questions into one number hides which of them a tool actually
+       failed, and the weights were an editorial choice that silently decided
+       the ordering: a reader could not tell whether a tool led because it
+       detected better or because the weighting happened to suit it.
 
-       It exists because ranking tools needs one number, and the three terms
-       answer three questions a thesis has to answer separately: is it any
-       good at finding flaws (F1), can it be trusted not to cry wolf (1-FPR),
-       and did it understand what the flaw was (CWE accuracy). The weights are
-       a stated editorial choice, visible and adjustable, not a hidden formula.
+       Every detector is now reported with the standard confusion matrix and
+       the measures derived from it, which is what the vulnerability-detection
+       literature reports and what a reader can compare against other work
+       without first learning this project's private formula.
 
-    4. Pairwise agreement between tools, as Cohen's kappa. This is the only
+       The summary table is ordered by F1 so that it is stable and readable.
+       That ordering is a presentation convenience, NOT a score: F1 ignores
+       true negatives entirely, so a tool leading on F1 may still be the one
+       crying wolf most often. Read the full row, not the position.
+
+    4. Per-round metrics. Re-analysing a run archives the previous detection
+       pass rather than discarding it, so one run can hold several passes --
+       "with Bandit alone" and "with Bandit plus an LLM", say. Each archived
+       round is scored with the same function as the current one, against the
+       same manifest, so the rows are directly comparable.
+
+       Comparability has one precondition, and it is checked rather than
+       assumed: a round scored before a re-judging pass was measured on a
+       different admitted sample set. Those rounds are flagged, because
+       comparing them against the current numbers would be comparing two
+       different datasets.
+
+    5. Pairwise agreement between tools, as Cohen's kappa. This is the only
        measure here that does not need ground truth, which makes it the one
        that still works on ingested GitHub code. Two tools that agree strongly
        are largely redundant; two that disagree are finding different things,
@@ -62,7 +98,7 @@ import sys
 
 import config
 import runstore
-from common import get_logger, write_json
+from common import get_logger, read_json, write_json
 
 LINE = "-" * 78
 
@@ -92,6 +128,8 @@ def score(manifest: list[dict], predictions: list[dict]) -> dict:
         A dict with the confusion-matrix counts and every metric described in
         the module docstring.
     """
+    tolerance = config.LOCALISATION_TOLERANCE_LINES
+
     truth = {entry["id"]: entry for entry in manifest}
     # Indexed by id so lookup does not depend on a detector having preserved
     # the manifest's ordering.
@@ -99,6 +137,8 @@ def score(manifest: list[dict], predictions: list[dict]) -> dict:
 
     tp = fp = tn = fn = 0
     cwe_correct = 0
+    # LOCALISATION -- see the block comment below the loop.
+    localisable = located = localised = 0
 
     for sample_id, entry in truth.items():
         # Samples with no ground truth (ingested code) cannot be scored for
@@ -126,6 +166,22 @@ def score(manifest: list[dict], predictions: list[dict]) -> dict:
                 # would reward a lucky guess about a flaw that is not there.
                 if pred and pred.get("predicted_cwe") == entry["cwe"]:
                     cwe_correct += 1
+
+                # Scored only on true positives, for the same reason as the
+                # CWE: there is no site to find in a sample the detector
+                # missed, and crediting a position inside a false positive
+                # would reward pointing precisely at a flaw that is not there.
+                truth_lines = entry.get("vulnerable_lines") or []
+                if truth_lines:
+                    localisable += 1
+                    predicted_lines = (pred.get("predicted_lines") or []
+                                       if pred else [])
+                    if predicted_lines:
+                        located += 1
+                        if any(abs(p - t) <= tolerance
+                               for p in predicted_lines
+                               for t in truth_lines):
+                            localised += 1
             else:
                 fn += 1
         else:
@@ -138,6 +194,32 @@ def score(manifest: list[dict], predictions: list[dict]) -> dict:
     recall = safe_div(tp, tp + fn)
     specificity = safe_div(tn, tn + fp)
     cwe_accuracy = safe_div(cwe_correct, tp)
+
+    # LOCALISATION -- did the detector point at the right place?
+    #
+    # Three counts rather than one ratio, because a single number cannot tell
+    # the two ways of scoring zero apart:
+    #
+    #   localisable  true positives whose ground truth records the vulnerable
+    #                lines. The denominator. Zero for a run whose samples have
+    #                no line-level ground truth (every generated run today),
+    #                which makes the whole block inert rather than wrong.
+    #   located      ... of those, how many the detector named any line for.
+    #   localised    ... of those, how many named a line within
+    #                config.LOCALISATION_TOLERANCE_LINES of a real one.
+    #
+    # So `localisation_accuracy` of 0.0 with `located` 0 means the detector
+    # never reports positions -- true of the LLM arm as currently prompted and
+    # of the ML arm, which answers per file. The same 0.0 with `located` high
+    # means it does report them and they are wrong. Those are opposite
+    # findings and the write-up must not merge them.
+    #
+    # `localisation_precision` is deliberately NOT computed. It would need
+    # every flawed line in each sample to be known, and the ground truth here
+    # records the lines a fix commit touched -- which is a lower bound, not a
+    # complete list. Reporting a precision against an incomplete key would
+    # punish a tool for finding a real flaw nobody had labelled.
+    localisation_accuracy = safe_div(localised, localisable)
 
     # Matthews Correlation Coefficient. The denominator is the square root of
     # the product of all four marginals; when any marginal is zero the
@@ -161,30 +243,12 @@ def score(manifest: list[dict], predictions: list[dict]) -> dict:
         "youden_j": recall + specificity - 1.0,
         "cwe_accuracy": cwe_accuracy,
         "cwe_correct": cwe_correct,
+        "localisable": localisable,
+        "localisation_reported": located,
+        "localised": localised,
+        "localisation_accuracy": localisation_accuracy,
     }
-    metrics["composite"] = composite_score(metrics)
     return metrics
-
-
-def composite_score(metrics: dict) -> float:
-    """Combine three metrics into the single ranking number.
-
-    See the module docstring for the rationale. The weights live in
-    config.COMPOSITE_WEIGHTS and are asserted to sum to 1.0, so a mistyped
-    weight cannot silently produce a score above 1.
-    """
-    weights = config.COMPOSITE_WEIGHTS
-    total = sum(weights.values())
-    if abs(total - 1.0) > 1e-9:
-        raise SystemExit(
-            f"config.COMPOSITE_WEIGHTS must sum to 1.0, but they sum to {total}."
-        )
-
-    return (
-        weights["f1"] * metrics["f1"]
-        + weights["tnr"] * (1.0 - metrics["fpr"])
-        + weights["cwe"] * metrics["cwe_accuracy"]
-    )
 
 
 def per_cwe(manifest: list[dict], predictions: list[dict]) -> dict[str, dict]:
@@ -298,6 +362,143 @@ def agreement_matrix(manifest: list[dict],
 # Report assembly
 # ---------------------------------------------------------------------------
 
+def score_round(manifest: list[dict], results: list[dict]) -> list[dict]:
+    """Score one detection pass: the standard metrics for each detector in it.
+
+    Shared by the current pass and every archived round, so a round can never
+    be scored by a different code path than the one it is compared against.
+    """
+    rows = []
+    for result in results:
+        metrics = score(manifest, result["predictions"])
+        rows.append({
+            "name": result.get("detector", result.get("detector_key", "?")),
+            "key": result.get("detector_key", ""),
+            "arm": result.get("detector_type", ""),
+            "tp": metrics["tp"], "fp": metrics["fp"],
+            "fn": metrics["fn"], "tn": metrics["tn"],
+            "accuracy": metrics["accuracy"],
+            "precision": metrics["precision"],
+            "recall": metrics["recall"],
+            "f1": metrics["f1"],
+            "fpr": metrics["fpr"],
+            "fnr": metrics["fnr"],
+            "mcc": metrics["mcc"],
+            "youden_j": metrics["youden_j"],
+            "cwe_accuracy": metrics["cwe_accuracy"],
+        })
+    return sorted(rows, key=lambda r: r["f1"], reverse=True)
+
+
+def build_rounds(run, manifest: list[dict], current: list[dict]) -> list[dict]:
+    """Score the current pass and every archived one, newest first.
+
+    Args:
+        run: the Run being evaluated.
+        manifest: the verified manifest everything is scored against.
+        current: the detector results of the live (unarchived) pass.
+
+    Returns:
+        One entry per pass. The first is always the current one, labelled as
+        such so a reader can tell it from the archive.
+    """
+    sample_count = len(manifest)
+    rounds = [{
+        "round_id": "current",
+        "is_current": True,
+        "label": "latest pass",
+        "archived_at": None,
+        "sample_count": sample_count,
+        "comparable": True,
+        "detectors": score_round(manifest, current),
+    }]
+
+    for meta in run.list_detection_rounds():
+        results = run.detection_results_for_round(meta["round_id"])
+        if not results:
+            continue
+        # A round scored against a different number of samples was measured on
+        # a different dataset -- almost always because the run was re-judged
+        # between passes. Its numbers are kept but marked, because putting
+        # them beside the current ones without a warning compares two
+        # different things.
+        archived_count = meta.get("sample_count")
+        comparable = archived_count in (None, sample_count)
+        rounds.append({
+            "round_id": meta["round_id"],
+            "is_current": False,
+            "label": meta.get("label", ""),
+            "archived_at": meta.get("archived_at"),
+            "sample_count": archived_count,
+            "comparable": comparable,
+            "detectors": score_round(manifest, results),
+        })
+    return rounds
+
+
+def build_baseline(run) -> dict | None:
+    """The scores of the run this one was derived from, for a direct contrast.
+
+    A perturbed run holds rewritten copies of another run's samples, so the
+    interesting question is not "how did this score" but "how much did it move
+    from the clean original". That needs the parent's numbers next to this
+    run's, which nothing else in the report provides.
+
+    The parent's STORED evaluation is read rather than recomputed. Its samples
+    are different files -- that is the whole point of a perturbed run -- so
+    scoring them against this run's manifest would be meaningless. Both sides
+    were scored against their own manifest by the same code, and because the
+    rewrite preserves labels the two manifests agree on every label, which is
+    what makes the comparison valid.
+
+    Returns:
+        `{run_id, label, detectors: [...]}` using the same row shape as a
+        round, or None when this run was not derived from another, the parent
+        is missing, or the parent has not been evaluated.
+    """
+    parent_id = run.metadata().get("derived_from")
+    if not parent_id or not runstore.is_valid_run_id(parent_id):
+        return None
+
+    try:
+        parent = runstore.load_run(parent_id)
+    except (SystemExit, OSError, ValueError):
+        return None
+
+    report_file = parent.evaluation_report_file
+    if not report_file.exists():
+        return None
+
+    try:
+        stored = read_json(report_file)
+    except (OSError, ValueError):
+        return None
+
+    rows = stored.get("ranking") or []
+    if not rows:
+        return None
+
+    # Older reports predate some columns. Fill them rather than letting the
+    # template render "undefined" in a table a supervisor is reading.
+    normalised = []
+    for row in rows:
+        normalised.append({
+            "name": row.get("name", "?"),
+            "arm": row.get("arm", ""),
+            **{key: row.get(key, 0) for key in (
+                "tp", "fp", "fn", "tn", "accuracy", "precision", "recall",
+                "f1", "fpr", "fnr", "mcc", "youden_j", "cwe_accuracy",
+            )},
+        })
+
+    return {
+        "run_id": parent_id,
+        "label": parent.metadata().get("label", ""),
+        "perturbations": run.metadata().get("perturbations", []),
+        "detectors": normalised,
+    }
+
+
 def build_report(run_id: str) -> dict:
     """Assemble the complete evaluation for one run as serialisable data.
 
@@ -401,10 +602,11 @@ def build_report(run_id: str) -> dict:
             },
         })
 
-    # Ranked by the composite score. Ties keep their input order, which is
+    # Ordered by F1 purely so the summary table is stable and readable --
+    # this is a sort order, not a score. Ties keep their input order, which is
     # alphabetical by filename, so the table is deterministic across runs.
     ranking = sorted(
-        detectors, key=lambda d: d["metrics"]["composite"], reverse=True
+        detectors, key=lambda d: d["metrics"]["f1"], reverse=True
     )
 
     # Per-sample detail, with every detector's verdict aligned to one row.
@@ -440,15 +642,26 @@ def build_report(run_id: str) -> dict:
                 "name": d["name"] + (" [STALE]" if d.get("is_stale") else ""),
                 "arm": d["arm"],
                 "coverage": d["coverage"],
-                "composite": d["metrics"]["composite"],
+                "tp": d["metrics"]["tp"],
+                "fp": d["metrics"]["fp"],
+                "fn": d["metrics"]["fn"],
+                "tn": d["metrics"]["tn"],
+                "accuracy": d["metrics"]["accuracy"],
+                "precision": d["metrics"]["precision"],
+                "recall": d["metrics"]["recall"],
                 "f1": d["metrics"]["f1"],
-                "mcc": d["metrics"]["mcc"],
                 "fpr": d["metrics"]["fpr"],
+                "fnr": d["metrics"]["fnr"],
+                "mcc": d["metrics"]["mcc"],
+                "youden_j": d["metrics"]["youden_j"],
                 "cwe_accuracy": d["metrics"]["cwe_accuracy"],
             }
             for position, d in enumerate(ranking, start=1)
         ],
-        "composite_weights": config.COMPOSITE_WEIGHTS,
+        "rounds": build_rounds(run, manifest, results),
+        # Present only on a derived run: the scores of the run it came from,
+        # so the change is readable without opening two pages.
+        "baseline": build_baseline(run),
         "agreement": agreement_matrix(manifest, results),
         "samples": samples,
     }
@@ -469,7 +682,6 @@ def evaluate_run(run_id: str, on_progress=None) -> dict:
         "run_id": run_id,
         "dataset": report["dataset"],
         "ranking": report["ranking"],
-        "composite_weights": report["composite_weights"],
         "agreement": report["agreement"],
     })
     run.comparison_text_file.write_text(
@@ -580,7 +792,26 @@ def render_report(report: dict) -> str:
             f"    CWE identification     {m['cwe_accuracy']:.3f}  "
             f"({m['cwe_correct']}/{m['tp']} correctly categorised)"
         )
-        out.append(f"    COMPOSITE              {m['composite']:.3f}")
+        # Printed only for runs carrying line-level ground truth; a generated
+        # run has none, and a row of zeros there would read as a failure
+        # rather than as a question that was never asked.
+        if m.get("localisable"):
+            out.append(
+                f"    Localisation           "
+                f"{m['localisation_accuracy']:.3f}  "
+                f"({m['localised']}/{m['localisable']} pointed within "
+                f"{config.LOCALISATION_TOLERANCE_LINES} line(s))"
+            )
+            if not m["localisation_reported"]:
+                out.append(
+                    "      this detector reports no line numbers, so the "
+                    "0.000 above means 'did not say', not 'said wrongly'"
+                )
+            elif m["localisation_reported"] < m["localisable"]:
+                out.append(
+                    f"      named a line for {m['localisation_reported']} of "
+                    f"{m['localisable']}; the rest gave a verdict only"
+                )
 
         # Side-by-side with the strict exact-CWE policy, where available.
         strict = detector.get("metrics_strict")
@@ -593,8 +824,7 @@ def render_report(report: dict) -> str:
             out.append(
                 f"      strict exact-match   TP={strict['tp']} FP={strict['fp']} "
                 f"TN={strict['tn']} FN={strict['fn']}  "
-                f"F1={strict['f1']:.3f}  MCC={strict['mcc']:+.3f}  "
-                f"composite={strict['composite']:.3f}"
+                f"F1={strict['f1']:.3f}  MCC={strict['mcc']:+.3f}"
             )
             if same:
                 out.append(
@@ -614,27 +844,108 @@ def render_report(report: dict) -> str:
                     f"{row['detected']}/{row['total']:<7} {row['named']}/{row['total']}"
                 )
 
-    # --- ranking ------------------------------------------------------------
-    weights = report["composite_weights"]
+    # --- summary table ------------------------------------------------------
+    # The standard confusion matrix and the measures derived from it, one row
+    # per detector. No combined score: see the module docstring for why.
     out.append("")
     out.append(LINE)
-    out.append("TOOL SET COMPARISON")
+    out.append("RESULTS -- all detectors, this round")
     out.append(LINE)
     out.append(
-        f"  composite = {weights['f1']:.2f}*F1 + {weights['tnr']:.2f}*(1-FPR) "
-        f"+ {weights['cwe']:.2f}*CWE_accuracy"
-    )
-    out.append("")
-    out.append(
-        f"  {'#':<3}{'detector':<34}{'arm':<9}"
-        f"{'compos':>8}{'F1':>7}{'MCC':>8}{'FPR':>7}{'CWE':>7}"
+        f"  {'detector':<32}{'arm':<8}"
+        f"{'TP':>4}{'FP':>4}{'FN':>4}{'TN':>4}"
+        f"{'Acc':>8}{'Prec':>7}{'Rec':>7}{'F1':>7}{'FPR':>7}{'MCC':>8}{'CWE':>7}"
     )
     for row in report["ranking"]:
         out.append(
-            f"  {row['rank']:<3}{row['name'][:33]:<34}{row['arm']:<9}"
-            f"{row['composite']:>8.3f}{row['f1']:>7.3f}"
-            f"{row['mcc']:>+8.3f}{row['fpr']:>7.3f}{row['cwe_accuracy']:>7.3f}"
+            f"  {row['name'][:31]:<32}{row['arm']:<8}"
+            f"{row['tp']:>4}{row['fp']:>4}{row['fn']:>4}{row['tn']:>4}"
+            f"{row['accuracy']:>8.3f}{row['precision']:>7.3f}"
+            f"{row['recall']:>7.3f}{row['f1']:>7.3f}{row['fpr']:>7.3f}"
+            f"{row['mcc']:>+8.3f}{row['cwe_accuracy']:>7.3f}"
         )
+    out.append("")
+    out.append(
+        "  Acc=accuracy  Prec=precision  Rec=recall  FPR=false positive rate"
+    )
+    out.append(
+        "  MCC=Matthews correlation (-1..+1, 0=chance)  "
+        "CWE=correct category among true positives"
+    )
+    out.append(
+        "  Rows are ordered by F1 for readability only -- that is a sort "
+        "order, not a score."
+    )
+
+    # --- baseline -----------------------------------------------------------
+    # Only on a derived run, where the question is how far the scores moved.
+    baseline = report.get("baseline")
+    if baseline:
+        current = {row["name"]: row for row in report["ranking"]}
+        out.append("")
+        out.append(LINE)
+        out.append(f"CHANGE FROM {baseline['run_id']}")
+        out.append(LINE)
+        if baseline.get("perturbations"):
+            out.append(f"  applied: {', '.join(baseline['perturbations'])}")
+        out.append(
+            f"  {'detector':<32}{'F1 before':>10}{'F1 now':>8}{'change':>8}"
+            f"{'MCC before':>12}{'MCC now':>9}{'change':>8}"
+        )
+        for row in baseline["detectors"]:
+            now = current.get(row["name"])
+            if not now:
+                continue
+            out.append(
+                f"  {row['name'][:31]:<32}"
+                f"{row['f1']:>10.3f}{now['f1']:>8.3f}"
+                f"{now['f1'] - row['f1']:>+8.3f}"
+                f"{row['mcc']:>+12.3f}{now['mcc']:>+9.3f}"
+                f"{now['mcc'] - row['mcc']:>+8.3f}"
+            )
+
+    # --- rounds -------------------------------------------------------------
+    # Only worth printing when there is something to compare against.
+    rounds = report.get("rounds", [])
+    if len(rounds) > 1:
+        out.append("")
+        out.append(LINE)
+        out.append(f"ROUND COMPARISON -- {len(rounds)} passes over this run")
+        out.append(LINE)
+        out.append(
+            "  Each pass is scored against the same verified samples, so the "
+            "rows are directly"
+        )
+        out.append("  comparable unless marked otherwise.")
+        for entry in rounds:
+            out.append("")
+            heading = (
+                "  current pass" if entry["is_current"]
+                else f"  {entry['round_id']}"
+            )
+            if entry.get("archived_at"):
+                heading += f"   archived {entry['archived_at'][:19].replace('T', ' ')}"
+            out.append(heading)
+            if entry.get("label") and not entry["is_current"]:
+                out.append(f"      note: {entry['label']}")
+            if not entry.get("comparable", True):
+                out.append(
+                    f"      [NOT COMPARABLE] scored on {entry['sample_count']} "
+                    f"samples, this report uses {len(report['samples'])} -- "
+                    "the run was re-judged in between."
+                )
+            out.append(
+                f"      {'detector':<32}{'TP':>4}{'FP':>4}{'FN':>4}{'TN':>4}"
+                f"{'Acc':>8}{'Prec':>7}{'Rec':>7}{'F1':>7}{'FPR':>7}{'MCC':>8}"
+            )
+            for row in entry["detectors"]:
+                out.append(
+                    f"      {row['name'][:31]:<32}"
+                    f"{row['tp']:>4}{row['fp']:>4}{row['fn']:>4}{row['tn']:>4}"
+                    f"{row['accuracy']:>8.3f}{row['precision']:>7.3f}"
+                    f"{row['recall']:>7.3f}{row['f1']:>7.3f}"
+                    f"{row['fpr']:>7.3f}{row['mcc']:>+8.3f}"
+                )
 
     # --- agreement ----------------------------------------------------------
     if report["agreement"]:

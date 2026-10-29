@@ -22,41 +22,54 @@
 </header>
 
 <section class="card">
-  <h2>Scoring method</h2>
+  <h2>How detectors are measured</h2>
   <p class="hint">
-    Tools are ranked by a composite of three metrics, weighted as an explicit
-    editorial choice rather than a hidden formula:
-  </p>
-  <p class="formula">
-    composite =
-    {{ weights.f1 }} &times; F1 +
-    {{ weights.tnr }} &times; (1 &minus; FPR) +
-    {{ weights.cwe }} &times; CWE&nbsp;accuracy
+    Every detector answers the same two questions on the same verified
+    samples &mdash; is this program vulnerable, and if so which CWE &mdash; so
+    one scoring function evaluates all of them against the same ground truth.
+    The numbers below are the standard measures derived from the confusion
+    matrix:
   </p>
   <ul class="notes">
-    <li><strong>F1</strong> &mdash; overall quality on the vulnerable class.</li>
     <li>
-      <strong>1 &minus; FPR</strong> &mdash; how far the tool can be trusted not
-      to cry wolf. A detector that flags everything scores well on recall and
-      is useless in practice; this term is what penalises it.
+      <strong>TP / FP / FN / TN</strong> &mdash; the confusion matrix itself.
+      Everything else is derived from these four counts.
     </li>
     <li>
-      <strong>CWE accuracy</strong> &mdash; whether the tool understood
-      <em>what</em> the flaw was, not merely that something was wrong.
+      <strong>Precision</strong> &mdash; of everything flagged, how much was
+      really vulnerable. <strong>Recall</strong> &mdash; of everything really
+      vulnerable, how much was caught. <strong>F1</strong> is their harmonic
+      mean.
+    </li>
+    <li>
+      <strong>FPR</strong> &mdash; the false-alarm rate on the safe twins. A
+      detector that flags everything scores well on recall and is useless in
+      practice; this is the column that exposes it.
+    </li>
+    <li>
+      <strong>MCC</strong> &mdash; a correlation over the whole confusion
+      matrix, &minus;1 to +1 with 0 meaning chance. Unlike accuracy it cannot
+      be inflated by always answering with the majority class, which matters
+      here because judging can leave the two classes uneven.
+    </li>
+    <li>
+      <strong>CWE id.</strong> &mdash; among the true positives, how often the
+      tool also named the right category: whether it understood <em>what</em>
+      the flaw was, not merely that something was wrong.
     </li>
   </ul>
   <p class="hint">
-    The weights live in <code>config.COMPOSITE_WEIGHTS</code> and must sum to
-    1.0. Two further single-number summaries appear in the per-run tables:
-    <strong>MCC</strong>, a correlation over the whole confusion matrix that
-    cannot be inflated by always answering with the majority class, and
-    <strong>Youden's J</strong>, which balances the two error types
-    symmetrically.
+    There is deliberately no combined score. An earlier version ranked tools
+    by a weighted sum of F1, (1&nbsp;&minus;&nbsp;FPR) and CWE accuracy; it was
+    removed because collapsing three different questions into one number hid
+    which of them a tool actually failed, and the weights silently decided the
+    ordering. Tables are sorted by F1 so they are stable and readable, but that
+    is a sort order and not a score &mdash; read the whole row.
   </p>
 </section>
 
 <section class="card">
-  <h2>Mean score per tool, across runs</h2>
+  <h2>Mean metrics per tool, across runs</h2>
   <p class="hint">
     Averaged over every evaluated run in which the tool appeared. Read the run
     count before reading the mean.
@@ -102,12 +115,14 @@ async function loadComparison() {
       if (!totals.has(row.name)) {
         totals.set(row.name, {
           name: row.name, arm: row.arm, runs: 0,
-          composite: 0, f1: 0, mcc: 0, fpr: 0, cwe: 0,
+          accuracy: 0, precision: 0, recall: 0, f1: 0, mcc: 0, fpr: 0, cwe: 0,
         });
       }
       const entry = totals.get(row.name);
       entry.runs += 1;
-      entry.composite += row.composite;
+      entry.accuracy += row.accuracy;
+      entry.precision += row.precision;
+      entry.recall += row.recall;
       entry.f1 += row.f1;
       entry.mcc += row.mcc;
       entry.fpr += row.fpr;
@@ -118,25 +133,27 @@ async function loadComparison() {
   const aggregated = Array.from(totals.values())
     .map((entry) => ({
       ...entry,
-      composite: entry.composite / entry.runs,
+      accuracy: entry.accuracy / entry.runs,
+      precision: entry.precision / entry.runs,
+      recall: entry.recall / entry.runs,
       f1: entry.f1 / entry.runs,
       mcc: entry.mcc / entry.runs,
       fpr: entry.fpr / entry.runs,
       cwe: entry.cwe / entry.runs,
     }))
-    .sort((a, b) => b.composite - a.composite);
+    .sort((a, b) => b.f1 - a.f1);
 
   buildTable(
     document.getElementById('aggregate-table'),
-    ['#', 'Detector', 'Arm', 'Runs', 'Mean composite', 'Mean F1',
-     'Mean MCC', 'Mean FPR', 'Mean CWE id.'],
-    aggregated.map((entry, index) => [
-      index + 1,
+    ['Detector', 'Arm', 'Runs', 'Mean accuracy', 'Mean precision',
+     'Mean recall', 'Mean F1', 'Mean FPR', 'Mean MCC', 'Mean CWE id.'],
+    aggregated.map((entry) => [
       {text: entry.name, className: 'strong'},
       entry.arm,
       entry.runs,
-      {text: fmt(entry.composite), className: 'strong'},
-      fmt(entry.f1), fmt(entry.mcc), fmt(entry.fpr), fmt(entry.cwe),
+      fmt(entry.accuracy), fmt(entry.precision), fmt(entry.recall),
+      {text: fmt(entry.f1), className: 'strong'},
+      fmt(entry.fpr), fmt(entry.mcc), fmt(entry.cwe),
     ]),
   );
 
@@ -157,13 +174,15 @@ async function loadComparison() {
     wrap.append(table);
     block.append(wrap);
     buildTable(table,
-      ['#', 'Detector', 'Arm', 'Composite', 'F1', 'MCC', 'FPR', 'CWE id.'],
+      ['Detector', 'Arm', 'TP', 'FP', 'FN', 'TN', 'Accuracy', 'Precision',
+       'Recall', 'F1', 'FPR', 'MCC', 'CWE id.'],
       run.ranking.map((row) => [
-        row.rank,
         {text: row.name, className: 'strong'},
         row.arm,
-        {text: fmt(row.composite), className: 'strong'},
-        fmt(row.f1), fmt(row.mcc), fmt(row.fpr), fmt(row.cwe_accuracy),
+        row.tp, row.fp, row.fn, row.tn,
+        fmt(row.accuracy), fmt(row.precision), fmt(row.recall),
+        {text: fmt(row.f1), className: 'strong'},
+        fmt(row.fpr), fmt(row.mcc), fmt(row.cwe_accuracy),
       ]));
 
     container.append(block);

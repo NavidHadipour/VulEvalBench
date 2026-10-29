@@ -23,14 +23,34 @@ WHAT THE JUDGE IS NOT
     would be marking its own homework. config.py keeps the default judge models
     and the default LLM-detector model distinct for this reason.
 
-WHY TWO JUDGES
-    Agreement between two independently-prompted models is much weaker evidence
+WHY MORE THAN ONE JUDGE
+    Agreement between independently-prompted models is much weaker evidence
     than a human review, but it is far stronger than trusting the generator
-    alone. Where the two disagree is exactly where the label is unreliable --
-    so with the default "all" consensus rule, disagreement drops the sample.
-    The web interface shows both judges' verdicts side by side so the
+    alone. Where the judges disagree is exactly where the label is unreliable
+    -- so with the default "all" consensus rule, disagreement drops the sample.
+    The web interface shows every judge's verdict side by side so the
     disagreements can be read, which is often the most informative view of a
     run.
+
+    Any number of judges can be selected and three slots are offered, because
+    two judges cannot resolve a disagreement: under "all" every dispute is
+    fatal, and there is no way to tell which of the two was wrong. A third
+    judge makes `JUDGE_CONSENSUS = "majority"` meaningful, where two agreeing
+    judges outvote one dissenter. Weaker verification, and reported as such --
+    see the note on the rule in config.py.
+
+TWO KINDS OF JUDGE
+    Most judges here are chat models forced into a JSON schema by guided
+    decoding. The System One models -- Jev and Laya -- are not: they read the
+    program once and answer typed questions (pick an option, score on a
+    rubric) with calibrated probabilities, and generate no text at all.
+
+    They answer the same questions and are held to the same admission rules,
+    so their verdicts are directly comparable. Two differences matter when
+    reading a run: their `confidence` is a real probability rather than a
+    number a chat model invented, and they produce no `reasoning` -- the field
+    carries their answer probabilities instead, marked as derived. See
+    `judge_one_typed` and the note above SYSTEMONE_MODELS in config.py.
 
 PRECAUTIONS
     1. One sample per request, with no conversation history. Sending the whole
@@ -59,7 +79,14 @@ from concurrent.futures import ThreadPoolExecutor
 import config
 import runstore
 from common import get_logger, write_json
-from providers import ProviderError, chat_json, provider_for_model
+from providers import (
+    ProviderError,
+    answer_confidence,
+    chat_json,
+    decide_typed,
+    provider_for_model,
+    systemone_load_notes,
+)
 
 # How many judgment requests to keep in flight at once.
 #
@@ -182,14 +209,16 @@ Analyse the following Python program.
 # One judge over one sample
 # ---------------------------------------------------------------------------
 
-def judge_one(model: str, code: str, system_prompt: str) -> dict:
-    """Ask one judge model about one program.
+def judge_one(model: str, code: str, system_prompt) -> dict:
+    """Ask one judge about one program, whichever kind of judge it is.
 
     Args:
         model: judgment model id, as served by the endpoint.
         code: the program's source.
-        system_prompt: the fully-formatted system prompt, built once by the
-            caller so the CWE list is not re-rendered for every sample.
+        system_prompt: for a chat judge, the fully-formatted system prompt;
+            for a System One judge, the question set from `typed_questions()`.
+            Built once by the caller either way, so the CWE list is not
+            re-rendered for every sample.
 
     Returns:
         A verdict dict. On a provider failure it returns a verdict carrying an
@@ -197,12 +226,19 @@ def judge_one(model: str, code: str, system_prompt: str) -> dict:
         sample, not the whole run. Such a verdict never agrees with anything,
         so the affected sample is dropped by the consensus rule below.
     """
-    # Two attempts: a failed judgment drops the sample entirely, so one retry
-    # against a transient truncation or timeout is cheap insurance against
-    # losing data to infrastructure rather than to disagreement.
     # The backend is derived from the model id, so Passau-hosted, Anthropic and
     # local models can all be selected as judges from the same dropdown.
     provider = provider_for_model(model)
+
+    # A System One model answers typed questions instead of a prompt, so it
+    # takes a different route to the same verdict shape. The caller does not
+    # need to know which kind of judge it selected.
+    if provider == "systemone":
+        return judge_one_typed(model, code, system_prompt)
+
+    # Two attempts: a failed judgment drops the sample entirely, so one retry
+    # against a transient truncation or timeout is cheap insurance against
+    # losing data to infrastructure rather than to disagreement.
 
     last_error = ""
     for _ in range(2):
@@ -245,6 +281,224 @@ def judge_one(model: str, code: str, system_prompt: str) -> dict:
         "vulnerability_count": data.get("vulnerability_count", -1),
         "confidence": confidence,
         "reasoning": data.get("reasoning", ""),
+        "input_tokens": result.input_tokens,
+        "output_tokens": result.output_tokens,
+    }
+
+
+# ---------------------------------------------------------------------------
+# One typed judge over one sample
+# ---------------------------------------------------------------------------
+# The same three questions the chat judges answer, in the form a System One
+# model takes them: a closed choice for the label, a closed choice over the
+# CWE list, and an ordinal score for the count. The wording is kept as close
+# to SYSTEM_PROMPT as the format allows -- including the anti-bias sentences,
+# which matter more here, not less: these models were trained on prose and
+# guardrail decisions, and a prompt that implies a vulnerability is expected
+# would push them the same way it pushes a chat model.
+
+TYPED_LABEL_INSTRUCTIONS = (
+    "The state is a single Python program. Decide whether it contains a "
+    "security vulnerability that is reachable from untrusted input. Judge only "
+    "the code in front of you: do not assume a vulnerability is present, and "
+    "do not assume the code is safe. Many of these programs are clean."
+)
+
+TYPED_CWE_INSTRUCTIONS = (
+    "If this program contains a security vulnerability reachable from "
+    "untrusted input, which category describes it? Choose 'none' if the "
+    "program has no such vulnerability."
+)
+
+TYPED_COUNT_INSTRUCTIONS = (
+    "How many DISTINCT security vulnerabilities does this program contain? Do "
+    "not count style issues, missing input validation with no security "
+    "consequence, or hardening you would merely prefer."
+)
+
+# Ordered, because a score question's level IS its position in this list.
+TYPED_COUNT_LEVELS = [
+    "No security vulnerability.",
+    "Exactly one security vulnerability.",
+    "Two or more distinct security vulnerabilities.",
+]
+
+
+def typed_questions() -> dict:
+    """Build the question set a System One judge answers.
+
+    Built once per run by the caller and reused for every sample, like the
+    chat judges' formatted system prompt.
+
+    Returns:
+        A `questions` object for `providers.decide_typed`.
+    """
+    # The CWE options carry their names as descriptions, which is what a choice
+    # question uses to tell the options apart -- the bare identifier "CWE-918"
+    # means nothing to a model that was never trained on the catalogue.
+    criteria = {
+        cwe: config.CWE_NAMES.get(cwe, cwe) for cwe in config.CWE_CATEGORIES
+    }
+    criteria["none"] = (
+        "No security vulnerability reachable from untrusted input."
+    )
+
+    return {
+        "label": {
+            "type": "choice",
+            "instructions": TYPED_LABEL_INSTRUCTIONS,
+            "criteria": {
+                config.LABEL_VULNERABLE: (
+                    "The program contains a security vulnerability that "
+                    "untrusted input can reach."
+                ),
+                config.LABEL_SAFE: (
+                    "The program has no such vulnerability."
+                ),
+            },
+        },
+        "cwe": {
+            "type": "choice",
+            "instructions": TYPED_CWE_INSTRUCTIONS,
+            "criteria": criteria,
+        },
+        "count": {
+            "type": "score",
+            "instructions": TYPED_COUNT_INSTRUCTIONS,
+            "criteria": TYPED_COUNT_LEVELS,
+        },
+    }
+
+
+def _argmax_level(answer: dict) -> int:
+    """The most probable level of a score answer, as an integer.
+
+    A score answer's `score` is the probability-weighted EXPECTED level, so a
+    model torn between "none" and "two or more" returns 1.0 -- the one value
+    neither of its candidates. For a count that must be compared against an
+    exact 0 or 1, the most probable level is the honest reading, so the
+    distribution is used rather than its mean.
+
+    Falls back to rounding `score` if `probabilities` is absent.
+    """
+    probabilities = answer.get("probabilities")
+    if isinstance(probabilities, dict) and probabilities:
+        best = max(probabilities.items(), key=lambda kv: kv[1])[0]
+        try:
+            return int(str(best).strip())
+        except (TypeError, ValueError):
+            pass
+    try:
+        return int(round(float(answer.get("score", -1))))
+    except (TypeError, ValueError):
+        return -1
+
+
+def _answer_confidence(answer: dict) -> float:
+    """How much probability a typed model put on the answer it gave, 0.0-1.0.
+
+    Delegates to `providers.answer_confidence`, which carries the reasoning
+    for WHICH of a System One answer's two confidence numbers is the right one
+    to read -- and the measurement showing that reading the wrong one flips
+    every verdict against JUDGE_MIN_CONFIDENCE. It lives there because the
+    detector arm needs the same reading, and nothing under detectors/ may
+    import this module: judging produces the ground truth the detectors are
+    scored against.
+    """
+    return answer_confidence(answer)
+
+
+def judge_one_typed(model: str, code: str, questions: dict) -> dict:
+    """Ask one System One judge about one program.
+
+    Returns the same verdict shape as `judge_one`, so the admission rule,
+    the stored files and the comparison page treat both kinds of judge
+    identically.
+
+    Args:
+        model: a System One model id (`config.SYSTEMONE_MODELS`).
+        code: the program's source. Passed as the `state` exactly as written:
+            there is no prompt to fence it off from, which also means none of
+            the "ignore previous instructions" exposure a chat judge has.
+        questions: the set from `typed_questions()`.
+
+    Returns:
+        A verdict dict. On failure it carries an `error` key and the sample is
+        treated as an abstention, exactly as for a chat judge.
+    """
+    last_error = ""
+    for _ in range(2):
+        try:
+            result = decide_typed(model, code, questions)
+            break
+        except ProviderError as exc:
+            last_error = str(exc)
+    else:
+        return {
+            "predicted_label": None,
+            "predicted_cwe": None,
+            "vulnerability_count": -1,
+            "confidence": 0.0,
+            "reasoning": "",
+            "error": last_error[:400],
+            "input_tokens": 0,
+            "output_tokens": 0,
+        }
+
+    answers = result.answers
+    label_answer = answers.get("label") or {}
+    cwe_answer = answers.get("cwe") or {}
+    count_answer = answers.get("count") or {}
+
+    label = label_answer.get("choice")
+    cwe = cwe_answer.get("choice")
+
+    # A response with no label answer did not judge this program, whatever
+    # else it returned. Reported as an error so the consensus rule treats it
+    # as an ABSTENTION: recording it as predicted_label=None instead would be
+    # read as a disagreement the judge never expressed, and under the "all"
+    # rule one malformed response would discard the sample.
+    if not label:
+        return {
+            "predicted_label": None,
+            "predicted_cwe": None,
+            "vulnerability_count": -1,
+            "confidence": 0.0,
+            "reasoning": "",
+            "error": (f"{model} returned no label answer; "
+                      f"answers: {sorted(answers)}"),
+            "input_tokens": result.input_tokens,
+            "output_tokens": result.output_tokens,
+        }
+
+    confidence = _answer_confidence(label_answer)
+
+    # "none" is this format's way of saying null: a choice question must pick
+    # one of its options, so the absence of a category has to be an option.
+    if cwe == "none" or label == config.LABEL_SAFE:
+        cwe = None
+
+    # No prose exists to put here, so the field carries the numbers the model
+    # actually produced. Marked, so nobody reads it as a model's own words.
+    label_probabilities = label_answer.get("probabilities") or {}
+    reasoning = (
+        "[no prose: typed decision model] "
+        + ", ".join(f"P({name})={float(value):.2f}"
+                    for name, value in sorted(label_probabilities.items())
+                    if isinstance(value, (int, float)))
+    )
+    if cwe_answer:
+        reasoning += (
+            f"; cwe={cwe_answer.get('choice')} "
+            f"p={_answer_confidence(cwe_answer):.2f}"
+        )
+
+    return {
+        "predicted_label": label,
+        "predicted_cwe": cwe,
+        "vulnerability_count": _argmax_level(count_answer),
+        "confidence": confidence,
+        "reasoning": reasoning,
         "input_tokens": result.input_tokens,
         "output_tokens": result.output_tokens,
     }
@@ -310,15 +564,25 @@ def run_judgement(
     run_id: str,
     judge_models: list[str] | None = None,
     on_progress=None,
+    should_stop=None,
 ) -> dict:
     """Judge every sample in a run and write the verified manifest.
 
     Args:
         run_id: the run to judge, as returned by `generate_dataset`.
-        judge_models: one or two judgment model ids. Defaults to the pair in
-            config. Passing one model is supported and simply means no
-            cross-model agreement check is performed.
+        judge_models: any number of judgment model ids, from any of the
+            registries in config -- the judgment endpoint, Anthropic, or the
+            System One models. Defaults to the pair in config. Passing one
+            model is supported and simply means no cross-model agreement check
+            is performed; three make `JUDGE_CONSENSUS = "majority"` meaningful.
         on_progress: callable taking one string; receives every log line.
+        should_stop: callable taking nothing, consulted before each judge
+            model. Checked between models rather than between samples: one
+            model's samples run in a thread pool, and the verified manifest is
+            written from the models that completed, so a judge is either fully
+            applied or not applied at all. A judge half-applied across the
+            samples would make "the judges agreed" mean different things for
+            different rows.
 
     Returns:
         A summary dict: how many samples were judged, how many survived, and
@@ -353,6 +617,11 @@ def run_judgement(
     )
     system_prompt = SYSTEM_PROMPT.format(cwe_list=cwe_list)
 
+    # The System One judges take typed questions rather than a prompt. Built
+    # here alongside the prompt, for the same reason: once per run, not once
+    # per sample.
+    questions = typed_questions()
+
     log.info("")
     log.info("=== Stage 2: judgement ===")
     log.info(
@@ -370,20 +639,46 @@ def run_judgement(
     verdicts_by_judge: dict[str, dict[str, dict]] = {}
 
     for model in judge_models:
-        log.info(f"  judge: {model}")
+        if should_stop is not None and should_stop():
+            log.warning(
+                f"  Stop requested; skipping {model} and every judge after "
+                "it. The verified manifest is written from the judges that "
+                "finished."
+            )
+            break
+
+        provider = provider_for_model(model)
+        kind = "typed decisions" if provider == "systemone" else "chat"
+        log.info(f"  judge: {model}  ({provider}, {kind})")
+
+        task = questions if provider == "systemone" else system_prompt
 
         # Samples are independent, so they parallelise safely. The pool is
         # small deliberately -- see JUDGE_CONCURRENCY.
-        with ThreadPoolExecutor(max_workers=JUDGE_CONCURRENCY) as pool:
+        #
+        # A local Laya checkpoint is the exception: it runs in this process on
+        # the CPU, so four threads do not make it faster -- they contend for
+        # the same cores while each holds a copy of the activations. One at a
+        # time is both faster and lighter there.
+        workers = 1 if model in config.LAYA_CHECKPOINTS else JUDGE_CONCURRENCY
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
             verdict_list = list(pool.map(
                 lambda entry: judge_one(
-                    model, run.read_sample_code(entry), system_prompt
+                    model, run.read_sample_code(entry), task
                 ),
                 manifest,
             ))
 
         verdicts = dict(zip((e["id"] for e in manifest), verdict_list))
         verdicts_by_judge[model] = verdicts
+
+        # What the checkpoint said about itself while loading. Reported here
+        # rather than dropped on stderr, because these warnings are about how
+        # far `confidence` can be trusted -- and JUDGE_MIN_CONFIDENCE admits
+        # or drops every sample on exactly that number.
+        for note in systemone_load_notes(model):
+            log.warning(f"    {model} calibration: {note}")
 
         errors = sum(1 for v in verdicts.values() if v.get("error"))
         agreed = sum(
@@ -395,14 +690,29 @@ def run_judgement(
             + (f"; {errors} call(s) failed" if errors else "")
         )
 
+        # A judge that answered nothing is a broken configuration, not a strict
+        # reviewer, and the distinction has to be loud: the symptom otherwise
+        # reaching the user is "0 samples admitted", which looks like a dataset
+        # quality problem and sends them hunting in the wrong place.
+        if errors == len(manifest) and manifest:
+            first_error = next(
+                (v.get("error", "") for v in verdicts.values() if v.get("error")),
+                "",
+            )
+            log.warning(
+                f"    {model} answered NONE of the {len(manifest)} samples -- "
+                "it is abstaining, not disagreeing. Check the model id against "
+                "the endpoint's /v1/models."
+            )
+            if first_error:
+                log.warning(f"      first error: {first_error[:200]}")
+
         # One file per judge, named after the model, so two judges' outputs sit
         # side by side in the run directory and are told apart at a glance.
         write_json(run.judgement_file(model), {
             "run_id": run_id,
             "judge_model": model,
-            "judge_display_name": config.JUDGMENT_MODELS.get(
-                model, config.ANTHROPIC_MODELS.get(model, model)
-            ),
+            "judge_display_name": config.model_display_name(model),
             "samples_judged": len(manifest),
             "agreed_with_generator": agreed,
             "failed_calls": errors,
@@ -425,11 +735,24 @@ def run_judgement(
     for entry in manifest:
         per_judge = {}
         agreements = []
+        abstained = []
 
         for model in judge_models:
             verdict = verdicts_by_judge[model][entry["id"]]
             agrees, reasons = verdict_agrees(entry, verdict)
-            agreements.append(agrees)
+
+            # A judge whose call failed ABSTAINS rather than voting "no".
+            #
+            # It never read the program, so its silence is not evidence that
+            # the label is wrong. Counting it as disagreement means one model
+            # being unreachable silently discards an entire run under the
+            # "all" rule -- which is exactly what happened when the endpoint
+            # stopped serving a model that /v1/models still advertised.
+            if reasons == ["judge_error"]:
+                abstained.append(model)
+            else:
+                agreements.append(agrees)
+
             per_judge[model] = {
                 "agrees": agrees,
                 "reasons": reasons,
@@ -440,10 +763,24 @@ def run_judgement(
                 "reasoning": verdict.get("reasoning", ""),
             }
 
-        admitted = (
-            all(agreements) if config.JUDGE_CONSENSUS == "all"
-            else any(agreements)
-        )
+        # With every judge abstaining there is no verification at all, so the
+        # sample is dropped -- but for the honest reason, which the record
+        # below preserves, rather than as a pretended disagreement.
+        #
+        # Every rule below counts only the judges that answered. An abstention
+        # is not half a vote: a majority of three judges where one was
+        # unreachable is two of two, not two of three.
+        if not agreements:
+            admitted = False
+        elif config.JUDGE_CONSENSUS == "all":
+            admitted = all(agreements)
+        elif config.JUDGE_CONSENSUS == "majority":
+            # Strictly more than half, so two of four is not a majority. With
+            # two judges this is the same as "all", which is why the rule only
+            # becomes a different rule at three.
+            admitted = sum(agreements) * 2 > len(agreements)
+        else:
+            admitted = any(agreements)
 
         # Recorded but not enforced: whether the judges also named the same CWE
         # the generator intended. Kept out of the admission rule because with a
@@ -461,6 +798,8 @@ def run_judgement(
             **entry,
             "judgement": {
                 "admitted": admitted,
+                "abstained": abstained,
+                "verified_by": [m for m in judge_models if m not in abstained],
                 "judges": per_judge,
                 "cwe_agreement": cwe_agreement,
                 "label_source": "generator+judge",
@@ -481,8 +820,13 @@ def run_judgement(
     write_json(run.judgement_dir / "judgement_comparison.json", {
         "run_id": run_id,
         "judges": [
-            {"model": m, "display_name": config.JUDGMENT_MODELS.get(
-                m, config.ANTHROPIC_MODELS.get(m, m))}
+            {"model": m, "display_name": config.model_display_name(m),
+             # Which kind of judge produced this column. The comparison page
+             # needs it to explain an empty reasoning cell, and a reader of
+             # the file needs it to know whether `confidence` is a calibrated
+             # probability or a number a chat model wrote.
+             "kind": ("typed" if provider_for_model(m) == "systemone"
+                      else "chat")}
             for m in judge_models
         ],
         "consensus_rule": config.JUDGE_CONSENSUS,
