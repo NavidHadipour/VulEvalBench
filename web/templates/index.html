@@ -121,15 +121,8 @@
     <label class="field">
       <span class="field-label">Previous run</span>
       <select id="existing_run" class="mono"></select>
-      <small>
-        Newest first, each line giving <code>#n</code> by creation order,
-        whether the samples are original or perturbed, how many survived
-        judging, and &larr; its parent.
-      </small>
-      <!-- The full id of whichever run is selected. Kept out of the list,
-           where its timestamp made every line unreadably long, but still on
-           the page because it is the name on disk and in every URL. -->
-      <small id="existing_run_id" class="mono muted"></small>
+      <small>History of all previous runs! The most recent comes on the
+        top!</small>
     </label>
   </div>
 
@@ -229,22 +222,8 @@
       {{ picks('Registered on this machine', registered_judges, None,
                judge_defaults) }}
     </div>
-    <small>
-      Click to toggle, up to {{ max_judges }} &mdash; fewer than three leaves
-      the consensus rules identical.
-    </small>
+    <small>Click to select/deselect up to {{ max_judges }}</small>
   </div>
-
-  <p class="hint">
-    A sample must satisfy the <strong>{{ judge_consensus }}</strong> rule to be
-    admitted, and the typed models answer in calibrated probabilities rather
-    than prose.
-  </p>
-
-  <p class="hint">
-    A judge whose call fails <strong>abstains</strong>, so the rule is applied
-    over the judges that answered rather than discarding the sample.
-  </p>
 
   <!-- --- tools under test ----------------------------------------------- -->
   <div class="config-title spaced">Tools under test</div>
@@ -293,10 +272,7 @@
       {{ picks('Registered on this machine', registered_models, None,
                default_llm_detectors) }}
     </div>
-    <small>
-      Click to toggle, or select none to skip the LLM arm; a model that also
-      judged is scored against labels it helped certify.
-    </small>
+    <small>Click to select/deselect the model(s)</small>
   </div>
 
   <label class="field checkbox" id="manual_selection_field">
@@ -585,16 +561,12 @@ async function loadExistingRuns() {
   for (const run of runs) {
     const option = el('option', null, describeRun(run, handles));
     option.value = run.run_id;
-    // The list is short by design; the exact id is a hover away, and also
-    // appears under the select for whichever run is chosen.
+    // The list is short by design, and each line is already prefixed with a
+    // #n handle; the exact id -- the name on disk and in every URL -- is a
+    // hover away on the option itself.
     option.title = run.run_id;
     select.append(option);
   }
-
-  const note = document.getElementById('existing_run_id');
-  const showId = () => { note.textContent = select.value; };
-  select.addEventListener('change', showId);
-  showId();
 }
 
 /* --- CWE chips ------------------------------------------------------- */
@@ -676,8 +648,7 @@ function refreshPickCounts() {
   if (llmCount) {
     llmCount.classList.remove('warn');
     llmCount.textContent =
-      llm === 0 ? 'none selected -- the LLM arm will be skipped'
-                : `${llm} selected`;
+      llm === 0 ? 'none selected' : `${llm} selected`;
   }
 }
 
