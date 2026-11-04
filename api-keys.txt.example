@@ -1,0 +1,53 @@
+# VulEvalBench credentials -- every API this installation can reach.
+#
+# Copy this file to `api-keys.txt` and fill in what you have. Version control
+# excludes `api-keys.txt`; this template is tracked, so never put a real
+# credential in it.
+#
+# One entry per line:
+#
+#     <name>.<field> = "<value>"
+#
+# `field` is either `url` or `key`.
+#
+# You can edit this file by hand, or manage it from the Models page of the
+# web UI, or with:
+#
+#     python src/manage_models.py keys
+#     python src/manage_models.py keys --set anthropic.key --value sk-ant-...
+#     python src/manage_models.py keys --delete openrouter
+
+
+# --- the shipped providers -------------------------------------------------
+# These four names are read by the framework itself. Only the judgment
+# endpoint is required; the other three are optional and their absence
+# disables the models that need them rather than stopping a run.
+
+# The OpenAI-compatible endpoint that serves the judges and the embedding
+# model. The url is the base -- the part before /v1/chat/completions.
+judgment.url = "https://llms.example.edu"
+judgment.key = "sk-..."
+
+# Anthropic, for the Claude models in config.ANTHROPIC_MODELS.
+anthropic.key = "sk-ant-..."
+
+# OpenAI, for the GPT models in config.OPENAI_MODELS. Note that this is NOT
+# an entry under "adding another API" below: api.openai.com speaks the same
+# protocol, but its newer models reject `max_tokens` and any temperature but
+# the default, so they are served by their own backend. A plain endpoint entry
+# would fail on the first call.
+openai.key = "sk-..."
+
+# TypeSafe, which serves the Jev System One model.
+typesafe.key = "..."
+
+
+# --- adding another API ----------------------------------------------------
+# Any other name carrying BOTH a url and a key becomes a provider you can
+# register models against on the Models page -- no code change needed. It is
+# called with the same OpenAI-compatible client as the judgment endpoint, so
+# the API must accept POST <url>/v1/chat/completions with a bearer token and
+# honour `response_format: {"type": "json_schema", ...}`.
+#
+# openrouter.url = "https://openrouter.ai/api"
+# openrouter.key = "sk-or-..."

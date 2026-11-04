@@ -9,6 +9,22 @@ protocol:
     "passau"     OpenAI-compatible vLLM API   judging samples, LLM detection,
                                               text embeddings for the ML arm
     "anthropic"  Anthropic Messages API       optional second-vendor detector
+    "openai"     OpenAI Chat Completions      optional third-vendor detector
+    "systemone"  TypeSafe /v1/systemone, and  judging samples with a typed,
+                 the local `laya` package     non-generative model
+
+THE LAST ONE IS NOT A CHAT BACKEND
+    `chat_json` covers the first four, because all four take a system prompt
+    and a user prompt and return text constrained to a JSON schema. System One
+    models do not: they take a `state` and a set of named typed questions, and
+    return a probability distribution per question. There is no prompt and no
+    generated text to parse.
+
+    So they get their own entry point, `decide_typed`, rather than being
+    disguised as chat models. A caller that wants a verdict from Jev or Laya
+    asks a different question in a different shape and gets calibrated
+    probabilities back -- which is the point of using them at all, and would be
+    thrown away by pretending the call was a chat completion.
 
 WHY WRAP THEM AT ALL
     Every stage of the pipeline wants the same thing: send a system prompt and
@@ -27,19 +43,43 @@ STRUCTURED OUTPUT IS NOT OPTIONAL HERE
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import re
+import warnings
 from dataclasses import dataclass, field
 
 import requests
 
 import config
-from common import load_anthropic_key, load_judgment_credentials
+import token_budgets
+from common import (
+    custom_endpoints,
+    endpoint_credentials,
+    load_anthropic_key,
+    load_judgment_credentials,
+    load_openai_key,
+    load_typesafe_key,
+)
 
 # Providers understood by `chat_json`. Exposed as a constant so the web layer
 # can validate a browser-supplied provider name against it rather than
 # trusting the request body.
-PROVIDERS = ("ollama", "passau", "anthropic")
+#
+# This is the *shipped* set. An installation can add more by putting a url and
+# a key in api-keys.txt under a new name -- see `all_providers()` -- which is
+# why nothing should compare against this tuple directly when it means "is
+# this provider callable".
+PROVIDERS = ("ollama", "passau", "anthropic", "openai", "systemone")
+
+
+def all_providers() -> tuple[str, ...]:
+    """Every provider callable here: the shipped four plus added endpoints.
+
+    Read at call time rather than cached, because a credential added on the
+    Models page must take effect without restarting the server.
+    """
+    return PROVIDERS + tuple(sorted(custom_endpoints()))
 
 
 def provider_for_model(model: str) -> str:
@@ -62,8 +102,27 @@ def provider_for_model(model: str) -> str:
     Returns:
         One of `PROVIDERS`.
     """
+    # An installation's own registry wins, because it is an explicit
+    # declaration by whoever set this up and beats inference from the shape of
+    # an id. It is also the only way a self-hosted copy of a model whose name
+    # looks like someone else's can be routed correctly.
+    try:
+        from model_registry import provider_of
+
+        declared = provider_of(model)
+        if declared:
+            return declared
+    except Exception:                                        # noqa: BLE001
+        # A broken overlay must not break provider resolution for the
+        # shipped models.
+        pass
+
     if model in config.ANTHROPIC_MODELS:
         return "anthropic"
+    if model in config.OPENAI_MODELS:
+        return "openai"
+    if model in config.SYSTEMONE_MODELS:
+        return "systemone"
     if model in config.JUDGMENT_MODELS:
         return "passau"
     if ":" in model:
@@ -344,6 +403,9 @@ def _chat_ollama(model: str, system: str, user: str, schema: dict,
             # A generation call must fit two whole programs plus the prompt;
             # the 2048-token default context would silently truncate them.
             "num_ctx": 8192,
+            # Same whitespace-loop guard as the vLLM path; `format` here is
+            # grammar-guided too, so the same stall is possible.
+            "stop": token_budgets.stop_sequences(),
         },
     }
 
@@ -374,7 +436,13 @@ def _chat_ollama(model: str, system: str, user: str, schema: dict,
         input_tokens=body.get("prompt_eval_count", 0),
         output_tokens=body.get("eval_count", 0),
         model=model,
-        meta={"done_reason": body.get("done_reason", "")},
+        # `done_reason` is Ollama's spelling; it is also mirrored under the
+        # name the other backends use, so a caller reasoning about why
+        # generation ended does not need a per-provider branch.
+        meta={
+            "done_reason": body.get("done_reason", ""),
+            "finish_reason": body.get("done_reason", ""),
+        },
     )
 
 
@@ -384,13 +452,38 @@ def _chat_ollama(model: str, system: str, user: str, schema: dict,
 
 def _chat_passau(model: str, system: str, user: str, schema: dict,
                  max_tokens: int) -> ChatResult:
-    """Call the OpenAI-compatible chat endpoint with json_schema decoding.
+    """Call the shipped judgment endpoint with json_schema decoding.
 
-    The endpoint is vLLM behind an OpenAI-compatible proxy, so it accepts the
-    standard `response_format: {"type": "json_schema", ...}` and enforces the
-    schema with guided decoding.
+    A thin alias for `_chat_openai_compatible` against the `judgment` entry,
+    kept because "passau" is the provider name written into every existing
+    run's `config_snapshot` and into models.local.json.
     """
-    creds = load_judgment_credentials()
+    return _chat_openai_compatible(
+        "judgment", model, system, user, schema, max_tokens
+    )
+
+
+def _chat_openai_compatible(endpoint: str, model: str, system: str, user: str,
+                            schema: dict, max_tokens: int) -> ChatResult:
+    """Call any OpenAI-compatible chat endpoint with json_schema decoding.
+
+    The Passau endpoint is vLLM behind an OpenAI-compatible proxy, so it
+    accepts the standard `response_format: {"type": "json_schema", ...}` and
+    enforces the schema with guided decoding. Everything that speaks the same
+    protocol can therefore use the same client, which is what makes a
+    user-added endpoint callable without new code -- see
+    `common.custom_endpoints()`.
+
+    Args:
+        endpoint: the credential entry name to call, e.g. "judgment".
+        model: the model id as that endpoint names it.
+
+    Raises:
+        ProviderError: on an unreachable endpoint or a non-2xx reply. The
+            endpoint name is in the message, because with several configured
+            "the API returned 401" is not enough to act on.
+    """
+    creds = endpoint_credentials(endpoint)
 
     payload = {
         "model": model,
@@ -402,6 +495,10 @@ def _chat_passau(model: str, system: str, user: str, schema: dict,
         # Low but non-zero: verdicts should be stable across repeats, while
         # leaving the model enough freedom not to lock onto one phrasing.
         "temperature": 0.2,
+        # Cuts a grammar-guided whitespace loop short. Guided decoding permits
+        # unlimited whitespace between structural tokens, so a stalled model
+        # can emit newlines until the budget is gone -- see token_budgets.
+        "stop": token_budgets.stop_sequences(),
         "response_format": {
             "type": "json_schema",
             "json_schema": {
@@ -423,12 +520,13 @@ def _chat_passau(model: str, system: str, user: str, schema: dict,
         )
     except requests.RequestException as exc:
         raise ProviderError(
-            f"Could not reach the judgment API at {creds['base_url']}: {exc}"
+            f"Could not reach the {endpoint} API at {creds['base_url']}: "
+            f"{exc}"
         ) from exc
 
     if not response.ok:
         raise ProviderError(
-            f"Judgment API returned HTTP {response.status_code}: "
+            f"{endpoint} API returned HTTP {response.status_code}: "
             f"{response.text[:300]}"
         )
 
@@ -444,6 +542,139 @@ def _chat_passau(model: str, system: str, user: str, schema: dict,
         output_tokens=usage.get("completion_tokens", 0),
         model=body.get("model", model),
         meta={"finish_reason": choice.get("finish_reason", "")},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Backend: OpenAI
+# ---------------------------------------------------------------------------
+# WHY THIS IS NOT JUST ANOTHER OPENAI-COMPATIBLE ENDPOINT
+#   api.openai.com speaks the protocol `_chat_openai_compatible` implements,
+#   and registering it as an endpoint in api-keys.txt very nearly works. It
+#   fails on two parameters -- measured against the live API, not assumed:
+#
+#     max_tokens      Every GPT-5 and GPT-6 model refuses it outright:
+#                     "Unsupported parameter: 'max_tokens' is not supported
+#                     with this model. Use 'max_completion_tokens' instead."
+#                     The vLLM endpoint and the GPT-4 generation accept both,
+#                     so `max_completion_tokens` goes to all of them and there
+#                     is no per-model branch to keep correct.
+#
+#     temperature     Refused by the same models unless it is the default:
+#                     "Unsupported value: 'temperature' does not support 0.2
+#                     with this model. Only the default (1) value is
+#                     supported." OpenAI's own guidance is to drop
+#                     temperature, top_p and the logprobs fields whenever
+#                     reasoning effort is anything but `none`.
+#
+#   So this backend sends no temperature at all. That gives up the deliberate
+#   0.2 the other backends use for verdict stability -- see
+#   `_chat_openai_compatible` -- and it is not a free choice: a judge at
+#   temperature 1 is a slightly noisier judge, and two runs of it agree a
+#   little less often. The alternative is a hardcoded list of which ids still
+#   accept a temperature, which would be wrong the next time OpenAI ships a
+#   family, and wrong silently.
+#
+#   `strict: true` IS sent, unlike on the vLLM path, because OpenAI then
+#   enforces the schema by construction. All of this project's schemas were
+#   checked against it: VERDICT_SCHEMA in judge.py and in
+#   detectors/llm_tools.py, including the `minimum`/`maximum` bounds on
+#   `confidence_percent` and the nullable `predicted_cwe`.
+
+
+def _chat_openai(model: str, system: str, user: str, schema: dict,
+                 max_tokens: int) -> ChatResult:
+    """Call the OpenAI Chat Completions API, constrained to `schema`.
+
+    Args:
+        model: an OpenAI model id, e.g. "gpt-6.1-sol".
+        max_tokens: sent as `max_completion_tokens`. On a reasoning model this
+            budget covers the thinking as well as the answer, and the thinking
+            is charged and counted but never returned -- so a budget large
+            enough for the JSON alone can be spent entirely on reasoning,
+            leaving an empty reply. That case is reported, not parsed.
+
+    Raises:
+        ProviderError: with no key configured, on an unreachable endpoint, on
+            a non-2xx reply, or when the budget ran out before any answer was
+            written.
+    """
+    key = load_openai_key()
+    if not key:
+        raise ProviderError(
+            "No OpenAI key found. Add it to api-keys.txt as:\n"
+            'openai.key = "sk-..."'
+        )
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        # See the note above for why this is not `max_tokens`, and why no
+        # temperature is sent.
+        "max_completion_tokens": max_tokens,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "structured_output",
+                "schema": schema,
+                "strict": True,
+            },
+        },
+    }
+
+    try:
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=300,
+        )
+    except requests.RequestException as exc:
+        raise ProviderError(f"Could not reach the OpenAI API: {exc}") from exc
+
+    if not response.ok:
+        raise ProviderError(
+            f"OpenAI API returned HTTP {response.status_code}: "
+            f"{response.text[:300]}"
+        )
+
+    body = response.json()
+    choice = body["choices"][0]
+    text = choice["message"]["content"] or ""
+    usage = body.get("usage", {})
+    finish = choice.get("finish_reason", "")
+    # Counted separately because it is charged separately, and because it
+    # explains an otherwise baffling bill: a one-line verdict from a reasoning
+    # model can cost several hundred tokens that never appear in the output.
+    reasoning_tokens = (
+        (usage.get("completion_tokens_details") or {}).get("reasoning_tokens", 0)
+    )
+
+    if not text.strip():
+        # Told apart from a parse failure, because the remedy differs: a
+        # truncated answer needs a larger budget or a model that thinks less,
+        # not a better prompt.
+        detail = (
+            f"spent its whole {max_tokens}-token budget on reasoning "
+            f"({reasoning_tokens} reasoning tokens) and returned no answer"
+            if finish == "length"
+            else f"returned an empty reply (finish_reason={finish!r})"
+        )
+        raise ProviderError(f"{model} {detail}")
+
+    return ChatResult(
+        data=extract_json(text),
+        raw_text=text,
+        input_tokens=usage.get("prompt_tokens", 0),
+        output_tokens=usage.get("completion_tokens", 0),
+        model=body.get("model", model),
+        meta={"finish_reason": finish, "reasoning_tokens": reasoning_tokens},
     )
 
 
@@ -555,6 +786,306 @@ def _chat_anthropic(model: str, system: str, user: str, schema: dict,
 
 
 # ---------------------------------------------------------------------------
+# System One: typed decisions instead of chat
+# ---------------------------------------------------------------------------
+# Wire format, identical for both models (TypeSafe document it; laya-serve
+# implements the same shape deliberately):
+#
+#   POST /v1/systemone
+#   {"model": ..., "state": <the text being judged>,
+#    "questions": {"<id>": {"type": "choice"|"score"|"noul", ...}}}
+#
+#   -> {"model": ..., "usage": {"input_tokens": n, "output_tokens": n},
+#       "answers": {"<id>": {"type": "choice", "choice": ...,
+#                            "confidence": 0-1, "probabilities": {...}}}}
+#
+# A `choice` question carries `criteria`: a map of option name to description,
+# up to 255 options. A `score` question carries `criteria` as an ordered list
+# of up to 10 level descriptions, the answer's `score` being the
+# probability-weighted expected level. A `noul` question needs no criteria and
+# answers with a single probability that the statement is true.
+
+
+@dataclass
+class TypedResult:
+    """One System One response, normalised across the hosted and local models.
+
+    Attributes:
+        answers: question id -> answer object, in the documented shape above.
+            Left as returned rather than flattened, because which fields are
+            present depends on the question type and the caller knows which it
+            asked.
+        input_tokens: prompt tokens reported by the backend, 0 if unreported.
+        output_tokens: as above. Jev bills input only; Laya is local and free.
+        model: the model version that actually answered, which for an alias
+            like `jev-latest` is more specific than what was requested and is
+            therefore what belongs in the run record.
+    """
+
+    answers: dict
+    input_tokens: int = 0
+    output_tokens: int = 0
+    model: str = ""
+
+
+def systemone_available(model: str) -> tuple[bool, str]:
+    """Report whether a System One model can be called, and why not if it cannot.
+
+    Returns a reason rather than raising, because this is called to decide what
+    to show in a dropdown. An unavailable model is offered but disabled, with
+    the reason beside it -- the alternative is a run that starts and then fails
+    on the first judgement call.
+
+    Args:
+        model: one of `config.SYSTEMONE_MODELS`.
+
+    Returns:
+        `(available, reason)`. `reason` is empty when available.
+    """
+    if model not in config.SYSTEMONE_MODELS:
+        return False, f"{model} is not a System One model"
+
+    if model in config.LAYA_CHECKPOINTS:
+        if importlib.util.find_spec("laya") is None:
+            return False, "the 'laya' package is not installed (pip install laya)"
+        return True, ""
+
+    if load_typesafe_key() is None:
+        return False, "no TypeSafe key in api-key-typesafe.txt"
+    return True, ""
+
+
+def _decide_jev(model: str, state: str, questions: dict,
+                timeout: int) -> TypedResult:
+    """Call the hosted TypeSafe endpoint."""
+    key = load_typesafe_key()
+    if not key:
+        raise ProviderError(
+            "No TypeSafe key found. Add it to api-key-typesafe.txt as:\n"
+            '"<your key>"\n'
+            "Jev is in early access; a key comes from the waitlist at "
+            "typesafe.ai."
+        )
+
+    try:
+        response = requests.post(
+            f"{config.TYPESAFE_BASE_URL}/v1/systemone",
+            headers={
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+            },
+            json={"model": model, "state": state, "questions": questions},
+            timeout=timeout,
+        )
+    except requests.RequestException as exc:
+        raise ProviderError(f"TypeSafe request failed: {exc}") from exc
+
+    if response.status_code != 200:
+        # The body carries the reason -- an unknown question type, a state over
+        # the context limit, an expired key -- and is far more useful than the
+        # status code alone.
+        raise ProviderError(
+            f"TypeSafe HTTP {response.status_code}: {response.text[:300]}"
+        )
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise ProviderError(
+            f"TypeSafe returned non-JSON: {response.text[:200]}"
+        ) from exc
+
+    answers = payload.get("answers")
+    if not isinstance(answers, dict) or not answers:
+        raise ProviderError(f"TypeSafe returned no answers: {str(payload)[:200]}")
+
+    usage = payload.get("usage") or {}
+    return TypedResult(
+        answers=answers,
+        input_tokens=int(usage.get("input_tokens", 0) or 0),
+        output_tokens=int(usage.get("output_tokens", 0) or 0),
+        model=payload.get("model", model),
+    )
+
+
+# One loaded Laya checkpoint per model id, kept for the life of the process.
+#
+# The checkpoint is a 0.4B encoder: loading it takes seconds and a few hundred
+# megabytes, and the judge calls it once per sample. Reloading per call would
+# dominate the stage's runtime -- the same mistake that made the ML arm's
+# availability check re-read an 8.6MB pickle on every page load.
+_LAYA_CACHE: dict[str, object] = {}
+
+# Warnings the checkpoint emitted while loading, per model id. Captured rather
+# than left on stderr: these are statements about how far its confidence can
+# be trusted, and a web run never shows stderr to anyone.
+_LAYA_NOTES: dict[str, list[str]] = {}
+
+
+def _laya_agent(model: str):
+    """Load, and then reuse, the local Laya checkpoint for `model`."""
+    if model in _LAYA_CACHE:
+        return _LAYA_CACHE[model]
+
+    try:
+        import laya
+    except ImportError as exc:
+        raise ProviderError(
+            "The 'laya' package is not installed: pip install laya"
+        ) from exc
+
+    checkpoint = config.LAYA_CHECKPOINTS[model]
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            agent = laya.load(checkpoint)
+    except Exception as exc:  # noqa: BLE001 - torch/HF raise many types
+        raise ProviderError(
+            f"Could not load Laya checkpoint {checkpoint}: {exc}"
+        ) from exc
+
+    _LAYA_NOTES[model] = [str(item.message) for item in caught]
+    _LAYA_CACHE[model] = agent
+    return agent
+
+
+def systemone_load_notes(model: str) -> list[str]:
+    """Warnings the model's checkpoint emitted when it was loaded.
+
+    Empty before the first call, because the checkpoint is loaded lazily, and
+    empty for the hosted model, which has no local checkpoint to complain.
+
+    Returns:
+        The warning texts, for a caller that will put them in the run log.
+    """
+    return list(_LAYA_NOTES.get(model, []))
+
+
+def _decide_laya(model: str, state: str, questions: dict) -> TypedResult:
+    """Run the local Laya checkpoint over one state.
+
+    Laya's Python API takes the same `(state, questions)` pair as the HTTP
+    protocol -- its own server implements TypeSafe's shape on top of this --
+    so the answers come back in the documented form and need no translation.
+    Only the container is normalised, since a local model reports no usage.
+    """
+    agent = _laya_agent(model)
+
+    try:
+        result = agent.predict(state, questions)
+    except Exception as exc:  # noqa: BLE001 - torch raises many types
+        raise ProviderError(f"Laya inference failed: {exc}") from exc
+
+    # The package returns either a plain dict or an object exposing one; both
+    # are accepted so a minor release that changes the wrapper does not break
+    # the judge.
+    if hasattr(result, "model_dump"):
+        payload = result.model_dump()
+    elif isinstance(result, dict):
+        payload = result
+    else:
+        payload = {"answers": getattr(result, "answers", None)}
+
+    answers = payload.get("answers", payload)
+    if not isinstance(answers, dict) or not answers:
+        raise ProviderError(f"Laya returned no answers: {str(payload)[:200]}")
+
+    return TypedResult(answers=answers, model=payload.get("model", model))
+
+
+def decide_typed(model: str, state: str, questions: dict,
+                 timeout: int = 90) -> TypedResult:
+    """Ask a System One model a set of typed questions about one state.
+
+    Args:
+        model: a key of `config.SYSTEMONE_MODELS`.
+        state: the content every question refers to -- here, one program.
+        questions: `{id: {"type": ..., ...}}` in the shape documented above.
+            At least one is required by the protocol.
+        timeout: seconds to wait on the hosted endpoint. Ignored for Laya,
+            which runs locally and cannot hang on a network.
+
+    Returns:
+        A `TypedResult`.
+
+    Raises:
+        ProviderError: on an unknown model, a missing key or package, a
+            transport failure, or a response carrying no answers.
+    """
+    if not questions:
+        raise ProviderError("decide_typed needs at least one question")
+
+    if model in config.LAYA_CHECKPOINTS:
+        return _decide_laya(model, state, questions)
+    if model in config.SYSTEMONE_MODELS:
+        return _decide_jev(model, state, questions, timeout)
+    raise ProviderError(f"Unknown System One model: {model}")
+
+
+def answer_confidence(answer: dict) -> float:
+    """How much probability the model put on the answer it gave, 0.0-1.0.
+
+    WHICH FIELD, AND WHY IT MATTERS
+        A System One answer can carry two different confidence numbers and
+        they are not interchangeable:
+
+            answer_confidence  max(p) -- the probability mass on the reported
+                               answer. Laya's own documentation calls this
+                               "the calibrated one, on every question type,
+                               so a caller can gate across types on a single
+                               number".
+            confidence         normalised Shannon entropy, 1 - H(p)/log(k):
+                               how concentrated the WHOLE distribution is.
+                               Its own docstring says it is "not calibrated:
+                               it is not what temperature scaling fits and
+                               not what the reported ECE measures".
+
+        The chat models report "how certain are you, 0-100", which is a
+        statement about the answer given -- so max(p) is the comparable
+        quantity and the entropy score is not. The difference decides runs:
+        on a real sample the label answer was P(not_vulnerable)=0.69, which
+        max(p) reports as 0.69 and the entropy score as 0.11. Against
+        JUDGE_MIN_CONFIDENCE = 0.60 the first is admitted and the second is
+        dropped as "low confidence" -- for a model that was not unsure at all.
+
+        So the preference order is: the backend's own calibrated field, then
+        max(p) computed from the distribution, and only then `confidence`.
+        Which branch runs depends on the backend, and both were checked:
+        Laya returns `answer_confidence` and takes the first; Jev's OpenAPI
+        schema has no such field, so it takes the second, which for a choice
+        answer is the same quantity. Neither reaches the third, and that is
+        the point of the order -- Jev documents its `confidence` as based on
+        how the probability is spread, which is the entropy-style measure
+        again, not the mass on the answer.
+
+    Used by both stages that consume a typed answer: judge.py, where it gates
+    admission, and detectors/llm_tools.py, where it becomes the detector's
+    reported confidence and is scored like any other tool's.
+
+    Args:
+        answer: one answer object from a System One response.
+
+    Returns:
+        A probability in 0.0-1.0, or 0.0 if the answer carries nothing usable.
+    """
+    value = answer.get("answer_confidence")
+    if isinstance(value, (int, float)):
+        return max(0.0, min(1.0, float(value)))
+
+    probabilities = answer.get("probabilities")
+    if isinstance(probabilities, dict) and probabilities:
+        numeric = [v for v in probabilities.values()
+                   if isinstance(v, (int, float))]
+        if numeric:
+            return max(0.0, min(1.0, float(max(numeric))))
+
+    value = answer.get("confidence")
+    if isinstance(value, (int, float)):
+        return max(0.0, min(1.0, float(value)))
+    return 0.0
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -567,7 +1098,8 @@ def chat_json(provider: str, model: str, system: str, user: str,
     backends differ.
 
     Args:
-        provider: one of `PROVIDERS`.
+        provider: one of `all_providers()` -- a shipped backend or an
+            endpoint named in api-keys.txt.
         model: backend-specific model identifier.
         system: the system prompt (rules that hold for every request).
         user: the user prompt (what varies per request).
@@ -583,12 +1115,44 @@ def chat_json(provider: str, model: str, system: str, user: str,
         ProviderError: on an unknown provider, an unreachable backend, or a
             response that cannot be parsed as JSON.
     """
+    # Every backend goes through the budget guard, including user-added
+    # endpoints, because a padding loop is a property of the model rather than
+    # of the protocol -- see token_budgets. `sent` equals `max_tokens` unless
+    # this model has already been caught padding at this call size.
+    sent = token_budgets.budget_for(model, max_tokens)
+    result = _dispatch(provider, model, system, user, schema, sent)
+    token_budgets.observe(model, max_tokens, sent, result)
+    return result
+
+
+def _dispatch(provider: str, model: str, system: str, user: str,
+              schema: dict, max_tokens: int) -> ChatResult:
+    """Route one call to its backend. Split out so `chat_json` can wrap it."""
     if provider == "ollama":
         return _chat_ollama(model, system, user, schema, max_tokens)
     if provider == "passau":
         return _chat_passau(model, system, user, schema, max_tokens)
     if provider == "anthropic":
         return _chat_anthropic(model, system, user, schema, max_tokens)
+    if provider == "openai":
+        return _chat_openai(model, system, user, schema, max_tokens)
+    if provider == "systemone":
+        # In PROVIDERS, but deliberately not reachable from here: these models
+        # generate no text, so there is no completion to constrain to a schema.
+        # Callers use decide_typed() and ask typed questions instead.
+        raise ProviderError(
+            f"{model} is a System One model and cannot answer a chat prompt. "
+            "Use decide_typed() with typed questions."
+        )
+    # Anything else must be an endpoint the installation added to api-keys.txt.
+    # Checked last so a user-added entry can never shadow a shipped provider,
+    # whatever it is called.
+    if provider in custom_endpoints():
+        return _chat_openai_compatible(
+            provider, model, system, user, schema, max_tokens
+        )
     raise ProviderError(
-        f"Unknown provider {provider!r}; expected one of {PROVIDERS}."
+        f"Unknown provider {provider!r}; expected one of "
+        f"{', '.join(all_providers())}. A provider added to api-keys.txt "
+        "needs both a url and a key before it can be called."
     )

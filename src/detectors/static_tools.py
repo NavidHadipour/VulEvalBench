@@ -177,12 +177,17 @@ def _verdict_from_findings(sample_id: str, findings: list[dict],
         f"{f.get('code', '?')} {f.get('message', '')}".strip()
         for f in in_scope[:3]
     )
+    # EVERY in-scope finding's line, not just the best one's. These tools are
+    # genuinely line-precise and a file can hold several real flaws, so
+    # narrowing to the highest-confidence finding would throw away locations
+    # the tool correctly reported and score it as mislocating them.
     return make_prediction(
         sample_id,
         True,
         best.get("cwe"),
         best.get("confidence", 0.6),
         f"{tool_name}: {detail}",
+        lines=[f.get("line") for f in in_scope if f.get("line")],
     )
 
 

@@ -40,8 +40,50 @@ semgrep>=1.173           # pattern matching PLUS taint analysis
 # caches it afterwards, so the first run on a machine needs network access.
 
 # --- detector arm 2: machine learning -------------------------------------
-scikit-learn>=1.4        # logistic regression, TF-IDF, stratified CV
-numpy>=1.26              # array handling for the embedding features
+# The arm holds FOUR detectors in two families, on two different protocols:
+#
+#   pretrained, frozen   ml_farasat (BiLSTM, Passau) and ml_vudenc (LSTM,
+#                        VUDENC). Published weights, asked exactly as Bandit
+#                        is -- tensorflow-cpu and tf-keras run these.
+#   trained per run      ml_tfidf and ml_embedding, fitted on the run's own
+#                        samples and predicted out of fold -- scikit-learn
+#                        runs these.
+#
+# tensorflow-cpu, not tensorflow: the GPU build buys nothing for inference on
+# seven small recurrent nets and costs a much larger download. tf-keras is the
+# maintained Keras 2 API -- Keras 3 cannot read these 2020-era .h5 files.
+#
+# The pretrained weights are NOT installed by pip. Fetch them once with:
+#     python src/fetch_models.py
+tensorflow-cpu>=2.16     # inference runtime for the pretrained models
+tf-keras>=2.16           # Keras 2 API; Keras 3 cannot load the published .h5
+numpy>=1.26              # array handling for the embedding lookup
+scikit-learn>=1.4        # TF-IDF, logistic regression, stratified CV
+#
+# VUDENC's TRAINING DATA is a separate, optional download and needs no package
+# beyond the standard library:
+#     python src/fetch_vudenc_dataset.py   # ~50 MB of security-fix commits
+#     python src/ingest_vudenc.py          # build a real-world paired run
+# It goes into datasets/, which .gitignore excludes -- it is third-party data.
+
+# --- optional: Laya, the local typed model --------------------------------
+# Needed only to select Laya, in either role -- it can be picked as a judge or
+# as a detector in the LLM arm, though not both on one run. It is a 0.4B
+# System One model: an
+# encoder that answers typed questions with calibrated probabilities instead
+# of generating text. It runs locally, so this pulls in torch and transformers
+# (~3 GB installed) and the checkpoint itself is fetched from Hugging Face on
+# first use. The pipeline runs fine without it, and the judge dropdown shows
+# the model disabled with the reason.
+#
+# The other System One judge, Jev, is hosted by TypeSafe and needs no package
+# at all -- only a key in api-key-typesafe.txt.
+#
+#     pip install laya
+#
+# Left commented out because it is by far the largest dependency here and
+# most runs do not need it.
+# laya>=0.4.12
 
 # --- optional: Anthropic models -------------------------------------------
 # Needed only if an Anthropic key is supplied in api-key-llm.txt. With one,

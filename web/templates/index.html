@@ -31,11 +31,19 @@
   <!-- Shown only for the generated source. -->
   <div id="generate-fields">
     <label class="field">
-      <span class="field-label">Pairs</span>
+      <span class="field-label">Samples</span>
       <input type="number" id="pairs" value="{{ default_pairs }}"
              min="{{ min_pairs }}" max="{{ max_pairs }}">
-      <small>Each pair = 1 vulnerable + 1 safe twin</small>
+      <small>One request per sample, up to {{ max_pairs }} from this
+        page.</small>
     </label>
+
+    <!-- Paired generation is gone: every run produces standalone programs,
+         each asked for on its own. There is no control twin to compare a
+         verdict against, so the negative class is an independently generated
+         program on the same topic and the label balance is whatever the
+         judges admit -- which is what the balancing step below exists to
+         even out. See config.GENERATE_TWINS. -->
 
     <!-- The generator block is labelled explicitly with its backend. Ollama is
          a model *server*, not a model, so there is no "use Ollama" option to
@@ -57,33 +65,23 @@
         <span>
           Served by <strong>Ollama</strong> on this machine
           {% if ollama_up %}
-            &mdash; {{ ollama_models|length }} model{{ '' if ollama_models|length == 1 else 's' }} pulled.
-            Runs locally, so generation costs nothing per call.
+            &mdash; {{ ollama_models|length }} model{{ '' if ollama_models|length == 1 else 's' }} pulled, free per call.
           {% else %}
-            &mdash; <strong>server not reachable.</strong> Start it with
-            <code>ollama serve</code>, then reload this page.
+            &mdash; <strong>not reachable</strong>; start it with
+            <code>ollama serve</code> and reload.
           {% endif %}
         </span>
       </div>
     </div>
 
     <label class="field">
-      <span class="field-label">CWE selection</span>
-      <select id="cwe_selection">
-        <option value="random" {% if cwe_selection == 'random' %}selected{% endif %}>
-          Random (independent draws)
-        </option>
-        <option value="cycle" {% if cwe_selection == 'cycle' %}selected{% endif %}>
-          Cycle (balanced coverage)
-        </option>
-      </select>
-      <small>Random matches the brief; cycle guarantees balance</small>
-    </label>
-
-    <label class="field">
       <span class="field-label">Seed</span>
-      <input type="number" id="seed" value="{{ default_seed }}">
-      <small>Blank = fresh randomness</small>
+      <input type="number" id="seed" value="{{ default_seed }}"
+             placeholder="blank = fresh randomness">
+      <small>
+        Blank draws fresh categories every run; a number repeats one run's
+        draw, though not the generated code.
+      </small>
     </label>
 
     <!-- The catalogue is a property of the benchmark design, so it is shown
@@ -113,8 +111,8 @@
              min="1" max="{{ max_ingest_files }}">
     </label>
     <p class="warn small">
-      Real code has no ground-truth labels, so accuracy, precision, recall, F1
-      and MCC are omitted for these runs. Tool agreement stays valid.
+      Real code has no labels, so accuracy-style metrics are omitted and only
+      tool agreement is reported.
     </p>
   </div>
 
@@ -122,9 +120,41 @@
   <div id="existing-fields" hidden>
     <label class="field">
       <span class="field-label">Previous run</span>
-      <select id="existing_run"></select>
-      <small>Re-runs the tools without regenerating samples</small>
+      <select id="existing_run" class="mono"></select>
+      <small>
+        Newest first, each line giving <code>#n</code> by creation order,
+        whether the samples are original or perturbed, how many survived
+        judging, and &larr; its parent.
+      </small>
+      <!-- The full id of whichever run is selected. Kept out of the list,
+           where its timestamp made every line unreadably long, but still on
+           the page because it is the name on disk and in every URL. -->
+      <small id="existing_run_id" class="mono muted"></small>
     </label>
+  </div>
+
+  <!-- Robustness option, only meaningful when re-analysing an existing run:
+       it rewrites samples that already exist. Placed before Judgement because
+       that is where it runs -- the judges then re-verify the rewritten code,
+       which is what tests the claim that the rewrite preserved the label. -->
+  <div id="perturb-fields" hidden>
+    <div class="config-title spaced">Robustness</div>
+    <label class="field checkbox">
+      <input type="checkbox" id="perturb">
+      <span>Apply noise to the code samples</span>
+    </label>
+    <small class="hint">
+      Rewrites each program without changing what it does.
+    </small>
+    <div id="perturb-kinds" class="cwe-grid">
+      {% for key, name in perturbations.items() %}
+      <label class="chip">
+        <input type="checkbox" class="perturb-check" value="{{ key }}"
+               {% if key in default_perturbations %}checked{% endif %}>
+        <span>{{ name }}</span>
+      </label>
+      {% endfor %}
+    </div>
   </div>
 
   <!-- --- judging -------------------------------------------------------- -->
@@ -138,8 +168,8 @@
     <span>
       Served by the <strong>remote judgment API</strong>, not Ollama
       {% if not (credentials.judgment_key and credentials.judgment_url) %}
-        &mdash; <strong>credentials missing.</strong> See
-        <code>api-key-judgment.txt</code>.
+        &mdash; <strong>credentials missing</strong> (see
+        <code>api-keys.txt</code>).
       {% endif %}
     </span>
   </div>
@@ -149,94 +179,143 @@
     <span>Verify labels before detection</span>
   </label>
 
-  <!-- Both model families are offered together. The backend is derived from
-       the model id by providers.provider_for_model(), so a Passau-hosted Qwen
-       and an Anthropic Claude can be mixed freely as Judge A and Judge B.
-       Anthropic entries are disabled when no key is present, rather than
-       failing once the run has started. -->
-  <label class="field">
-    <span class="field-label">Judge A</span>
-    <select id="judge_a">
-      <option value="">none</option>
-      <optgroup label="Judgment API">
-        {% for model, name in judgment_models.items() %}
-          <option value="{{ model }}"
-            {% if model == default_judge_a %}selected{% endif %}>{{ name }}</option>
-        {% endfor %}
-      </optgroup>
-      <optgroup label="Anthropic{% if not credentials.anthropic_key %} (no key){% endif %}">
-        {% for model, name in anthropic_models.items() %}
-          <option value="{{ model }}"
-            {% if not credentials.anthropic_key %}disabled{% endif %}>{{ name }}</option>
-        {% endfor %}
-      </optgroup>
-    </select>
-  </label>
+  <!-- Judges, as a click-to-toggle pick list.
+       One shared macro renders every family, because the backend is derived
+       from the model id by providers.provider_for_model() -- a Passau-hosted
+       Qwen, an Anthropic Claude and a typed System One model can be mixed
+       freely. An entry that cannot run (no key, package missing) is rendered
+       disabled with the reason, rather than accepted and then failing once
+       the run has started and the samples have been paid for.
 
-  <label class="field">
-    <span class="field-label">Judge B</span>
-    <select id="judge_b">
-      <option value="">none (single judge)</option>
-      <optgroup label="Judgment API">
-        {% for model, name in judgment_models.items() %}
-          <option value="{{ model }}"
-            {% if model == default_judge_b %}selected{% endif %}>{{ name }}</option>
+       Three dropdowns used to stand here, one per slot. They enforced the
+       cap by existing, but they also allowed the same model in two slots,
+       needed a "none" option in each, and made "which judges am I running"
+       a question you answered by reading three separate controls. -->
+  {% macro picks(group, models, statuses=None, selected=None) %}
+    {% if models %}
+    <div class="pick-group">
+      <span class="pick-group-title">{{ group }}</span>
+      <div class="picks">
+        {% for model, name in models.items() %}
+          {%- set why = statuses.get(model) if statuses else '' %}
+          <button type="button"
+                  class="pick{% if why %} disabled{% elif selected and model in selected %} selected{% endif %}"
+                  data-model="{{ model }}"
+                  {% if why %}disabled title="{{ why }}"{% endif %}>
+            {{ name }}{% if why %} &mdash; {{ why }}{% endif %}
+          </button>
         {% endfor %}
-      </optgroup>
-      <optgroup label="Anthropic{% if not credentials.anthropic_key %} (no key){% endif %}">
-        {% for model, name in anthropic_models.items() %}
-          <option value="{{ model }}"
-            {% if not credentials.anthropic_key %}disabled{% endif %}>{{ name }}</option>
-        {% endfor %}
-      </optgroup>
-    </select>
-    <small>Two judges are shown side by side; a sample must satisfy both</small>
-  </label>
+      </div>
+    </div>
+    {% endif %}
+  {% endmacro %}
+
+  <div class="field">
+    <span class="field-label">
+      Judges <span class="pick-count" id="judge-count"></span>
+    </span>
+    <div class="picklist" id="judge-picks" data-max="{{ max_judges }}">
+      {{ picks('Judgment API', judgment_models, None, judge_defaults) }}
+      {{ picks('Anthropic' ~ ('' if credentials.anthropic_key else ' (no key)'),
+               anthropic_models,
+               none if credentials.anthropic_key else anthropic_blocked,
+               judge_defaults) }}
+      {{ picks('OpenAI' ~ ('' if credentials.openai_key else ' (no key)'),
+               openai_models,
+               none if credentials.openai_key else openai_blocked,
+               judge_defaults) }}
+      {{ picks('Typed decision models (no prose)', systemone_models,
+               systemone_status, judge_defaults) }}
+      {{ picks('Registered on this machine', registered_judges, None,
+               judge_defaults) }}
+    </div>
+    <small>
+      Click to toggle, up to {{ max_judges }} &mdash; fewer than three leaves
+      the consensus rules identical.
+    </small>
+  </div>
+
+  <p class="hint">
+    A sample must satisfy the <strong>{{ judge_consensus }}</strong> rule to be
+    admitted, and the typed models answer in calibrated probabilities rather
+    than prose.
+  </p>
+
+  <p class="hint">
+    A judge whose call fails <strong>abstains</strong>, so the rule is applied
+    over the judges that answered rather than discarding the sample.
+  </p>
 
   <!-- --- tools under test ----------------------------------------------- -->
   <div class="config-title spaced">Tools under test</div>
 
+  <!-- Static and ML detectors, as the same click-to-toggle picks the judges
+       and the LLM models use. They were checkboxes; one interaction for
+       every "which of these do I want" question is easier to use and leaves
+       one piece of selection code to be right. An unavailable tool is
+       rendered disabled with the reason in its tooltip. -->
   {% for arm, entries in arms.items() %}
     {% if entries %}
-      <div class="tool-group">
-        <div class="tool-group-title">{{ arm_names[arm] }}</div>
-        {% for entry in entries %}
-          <label class="field checkbox"
-                 title="{{ entry.blurb }}">
-            <input type="checkbox" class="tool-check" value="{{ entry.key }}"
-                   {% if entry.key in default_tools %}checked{% endif %}
-                   {% if not tool_status.get(entry.key) %}disabled{% endif %}>
-            <span class="{% if not tool_status.get(entry.key) %}muted{% endif %}">
-              {{ entry.name }}
-              {% if not tool_status.get(entry.key) %}(unavailable){% endif %}
-            </span>
-          </label>
-        {% endfor %}
+      <div class="pick-group">
+        <span class="pick-group-title">{{ arm_names[arm] }}</span>
+        <div class="picks tool-picks">
+          {% for entry in entries %}
+            {%- set usable = tool_status.get(entry.key) %}
+            <button type="button"
+                    class="pick{% if not usable %} disabled{% elif entry.key in default_tools %} selected{% endif %}"
+                    data-tool="{{ entry.key }}"
+                    title="{{ entry.blurb }}"
+                    {% if not usable %}disabled{% endif %}>
+              {{ entry.name }}{% if not usable %} &mdash; unavailable{% endif %}
+            </button>
+          {% endfor %}
+        </div>
       </div>
     {% endif %}
   {% endfor %}
 
-  <label class="field">
-    <span class="field-label">LLM detector model(s)</span>
-    <select id="llm_models" multiple size="7">
-      <optgroup label="Judgment API">
-        {% for model, name in judgment_models.items() %}
-          <option value="{{ model }}"
-            {% if model == default_llm_detector %}selected{% endif %}>{{ name }}</option>
-        {% endfor %}
-      </optgroup>
-      <optgroup label="Anthropic{% if not credentials.anthropic_key %} (no key){% endif %}">
-        {% for model, name in anthropic_models.items() %}
-          <option value="{{ model }}"
-            {% if not credentials.anthropic_key %}disabled{% endif %}>{{ name }}</option>
-        {% endfor %}
-      </optgroup>
-    </select>
+  <div class="field">
+    <span class="field-label">
+      LLM detector models <span class="pick-count" id="llm-count"></span>
+    </span>
+    <div class="picklist" id="llm-picks">
+      {{ picks('Judgment API', judgment_models, None, default_llm_detectors) }}
+      {{ picks('Anthropic' ~ ('' if credentials.anthropic_key else ' (no key)'),
+               anthropic_models,
+               none if credentials.anthropic_key else anthropic_blocked,
+               default_llm_detectors) }}
+      {{ picks('OpenAI' ~ ('' if credentials.openai_key else ' (no key)'),
+               openai_models,
+               none if credentials.openai_key else openai_blocked,
+               default_llm_detectors) }}
+      {{ picks('Typed decision models (no prose)', systemone_models,
+               systemone_status, default_llm_detectors) }}
+      {{ picks('Registered on this machine', registered_models, None,
+               default_llm_detectors) }}
+    </div>
     <small>
-      Ctrl-click for several; each becomes its own row in the comparison.
-      Keep these different from the judges.
+      Click to toggle, or select none to skip the LLM arm; a model that also
+      judged is scored against labels it helped certify.
     </small>
+  </div>
+
+  <label class="field checkbox" id="manual_selection_field">
+    <input type="checkbox" id="manual_selection" checked>
+    <span>Review samples after judging</span>
   </label>
+  <small class="field-hint">
+    Pauses after judging so you can drop or restore individual samples before
+    the detectors are scored.
+  </small>
+
+  <label class="field checkbox" id="balance_review_field">
+    <input type="checkbox" id="balance_review">
+    <span>Balance the remaining dataset</span>
+  </label>
+  <small class="field-hint">
+    Pauses after judging to offer label and class balancing against what
+    actually survived.
+  </small>
 
   <label class="field">
     <span class="field-label">Run label</span>
@@ -244,6 +323,11 @@
   </label>
 
   <div class="actions">
+    <!-- One control with two modes. While a job holds the worker there is
+         nothing else this button could usefully do -- it used to sit there
+         disabled -- and stopping is wanted at exactly the moment the run is
+         going, so it becomes the stop. setRunButtonMode() owns its text,
+         class and meaning; nothing else writes them. -->
     <button id="run-btn" class="primary">Run pipeline</button>
   </div>
   <div id="run-note" class="note"></div>
@@ -262,27 +346,133 @@
 <!-- Live progress. The log is exactly the text the CLI prints, forwarded by
      the on_progress callback, and also written to logs/&lt;run_id&gt;.log. -->
 <section class="card" id="progress-card" hidden>
-  <h2>Progress <span id="state-badge" class="badge"></span></h2>
+  <h2>
+    Progress <span id="state-badge" class="badge"></span>
+  </h2>
+  <p class="warn" id="stop-note" hidden></p>
+
+  <!-- Per-sample counter for the model in flight. Fed by /api/status's
+       `progress`, which the stages update once per sample; the log below
+       keeps only a milestone line every tenth of the way, so this is the
+       only place a long stage shows movement. Hidden when nothing is
+       counting -- a bar frozen at 100% would read as a stall. -->
+  <div class="progress" id="progress-meter" hidden>
+    <div class="progress-head">
+      <span class="progress-label" id="progress-label"></span>
+      <span class="progress-count muted" id="progress-count"></span>
+    </div>
+    <div class="progress-track">
+      <div class="progress-fill" id="progress-fill"></div>
+    </div>
+  </div>
+
   <pre id="log" class="log"></pre>
+</section>
+
+<!-- Manual sample review. Shown only while the worker is parked in the
+     "selecting" state, between generation and judging. -->
+<section class="card" id="selection-card" hidden>
+  <h2><span id="selection-heading">Review samples</span>
+      <span id="selection-count" class="badge"></span></h2>
+  <p class="muted" id="selection-intro">
+    Keep or drop each sample, then continue. The detectors will be scored on
+    exactly what you keep.
+  </p>
+
+  <div class="selection-actions">
+    <button type="button" class="ghost" id="sel-judged">As judged</button>
+    <button type="button" class="ghost" id="sel-all">Keep all</button>
+    <button type="button" class="ghost" id="sel-none">Drop all</button>
+    <button type="button" class="ghost" id="sel-invert">Invert</button>
+    <button type="button" class="ghost" id="sel-vuln">Only vulnerable</button>
+    <button type="button" class="ghost" id="sel-safe">Only safe</button>
+  </div>
+
+  <div id="selection-list" class="selection-list"></div>
+
+  <p class="warn" id="selection-warning" hidden></p>
+
+  <!-- Stage 2c, on the set chosen above.
+       Here rather than in the run configuration because the cost is only
+       knowable now: the composition line below is the set as it currently
+       stands, and both steps only ever drop. -->
+  <fieldset class="balance-panel" id="balance_field">
+    <legend>Then balance what is left (optional)</legend>
+
+    <p class="muted" id="balance-composition"></p>
+
+    <label class="checkbox">
+      <input type="checkbox" id="balance_labels">
+      <span>Equal vulnerable and safe</span>
+    </label>
+    <small class="field-hint">
+      Drops from whichever label is over-represented until the two match.
+      Without this, accuracy is read against whatever mix you keep &mdash; on
+      a 70% vulnerable set, a detector that flags everything scores 0.70 and
+      has detected nothing. Samples are generated independently, so the label
+      mix is whatever the judges happened to admit; this is what evens it.
+    </small>
+
+    <label class="checkbox">
+      <input type="checkbox" id="balance_classes">
+      <span>Equal across vulnerability classes</span>
+    </label>
+    <small class="field-hint">
+      Drops down to the smallest class, so the ranking is not mostly a
+      ranking of whichever CWE happens to dominate. A class with only one of
+      the two labels cannot be evened out and is dropped whole, by name.
+    </small>
+
+    <small class="field-hint">
+      <strong>Ticking both targets a grid</strong> &mdash; every class the
+      same size <em>and</em> even within itself. Classes alone can undo the
+      label step, so doing both at once is not the same as doing them in
+      sequence.
+      Nothing is deleted: the generation, verified and selected manifests all
+      survive, so the drop stays auditable, and the full composition report is
+      printed to the log above either way.
+    </small>
+  </fieldset>
+
+  <div class="actions selection-submit">
+    <button type="button" class="primary" id="selection-continue">Continue</button>
+    <button type="button" class="ghost" id="selection-cancel">Cancel run</button>
+    <span class="note" id="selection-note"></span>
+  </div>
 </section>
 
 <section class="card" id="results-card" hidden>
   <h2>Results</h2>
   <div id="dataset-summary" class="stats"></div>
 
-  <h3>Tool set comparison</h3>
-  <p class="hint" id="weights-note"></p>
-  <div class="scroll"><table id="ranking-table"></table></div>
+  <!-- Each section folds. Only this pass's results open by default: a run
+       can also carry a block per earlier pass and one for the baseline run,
+       and all of them expanded at once is a wall of similar numbers. -->
+  <details class="fold" open>
+    <summary>This pass
+      <span class="fold-note" id="results-note"></span></summary>
+    <div class="fold-body">
+      <p class="hint" id="weights-note"></p>
+      <div class="scroll"><table id="ranking-table"></table></div>
+    </div>
+  </details>
 
-  <h3>Full metrics</h3>
-  <div class="scroll"><table id="metrics-table"></table></div>
+  <!-- Earlier passes over the same samples, and the clean run a perturbed
+       run came from. Empty unless there is something to compare against. -->
+  <div id="comparison-blocks"></div>
 
-  <h3>Pairwise agreement</h3>
-  <p class="hint">
-    Cohen's kappa: 1.0 identical, 0.0 chance. Tools that agree strongly are
-    largely redundant; disagreement is where the comparison gets interesting.
-  </p>
-  <div class="scroll"><table id="agreement-table"></table></div>
+  <details class="fold">
+    <summary>Pairwise agreement
+      <span class="fold-note">how far the detectors are redundant</span></summary>
+    <div class="fold-body">
+      <p class="hint">
+        Cohen's kappa: 1.0 identical, 0.0 chance. Tools that agree strongly
+        are largely redundant; disagreement is where the comparison gets
+        interesting.
+      </p>
+      <div class="scroll"><table id="agreement-table"></table></div>
+    </div>
+  </details>
 
   <p class="hint">
     <a id="detail-link" href="#">Open the full run page</a>
@@ -308,6 +498,13 @@
 const POLL_INTERVAL_MS = 1000;
 let pollTimer = null;
 
+/* Every state in which the worker thread is occupied, so a refreshed page can
+   reattach and the stop button knows when to appear. Mirrors
+   app.py's job_is_running(); 'stopped' is terminal and absent from both. */
+const RUNNING_STATES = ['starting', 'generating', 'ingesting', 'perturbing',
+                        'selecting', 'balancing', 'judging', 'detecting',
+                        'evaluating'];
+
 /* --- source-dependent fields ---------------------------------------- */
 
 function syncSourceFields() {
@@ -316,8 +513,58 @@ function syncSourceFields() {
   document.getElementById('ingest-fields').hidden =
     !(source === 'github' || source === 'local');
   document.getElementById('existing-fields').hidden = source !== 'existing';
+  document.getElementById('perturb-fields').hidden = source !== 'existing';
+  syncPerturbFields();
 
   if (source === 'existing') loadExistingRuns();
+}
+
+/* Short, stable handles for the runs.
+
+   Numbered from the oldest, so a new run always takes the next number and
+   never renumbers the ones already listed. The number stands in for the run
+   id in the dropdown: the id leads with a date and time, which made every
+   line long and near-identical to its neighbours, and the list is sorted by
+   date anyway, so the timestamp was being read three times over.
+
+   The full id of the selected run is shown under the select instead. */
+function runHandles(runs) {
+  const handles = {};
+  const oldestFirst = runs.slice().sort(
+    (a, b) => String(a.created_at || '').localeCompare(String(b.created_at || '')));
+  oldestFirst.forEach((run, index) => { handles[run.run_id] = `#${index + 1}`; });
+  return handles;
+}
+
+/* One short line per run, carrying what is needed to pick the right one
+   without opening it: which generation of the samples it holds, whether they
+   were perturbed, how much of the dataset survived judging, and which run it
+   came from.
+
+   Example:   #39   v2 noisy   59/59 verified   <- #28  */
+function describeRun(run, handles) {
+  const parts = [(handles[run.run_id] || run.run_id).padEnd(4)];
+
+  // Generation of the samples, and whether they were perturbed. Both are in
+  // the id too, but spelled out here so "_noisy_v2.0" needs no explaining --
+  // and said in both directions, so an original run is marked rather than
+  // being the one you identify by seeing no mark.
+  const marks = [`v${run.version || 1}`, run.sample_state || 'original'];
+  parts.push(marks.join(' ').padEnd(12));
+
+  // How much of the dataset is usable. An unjudged run says so rather than
+  // showing a verified count it does not have.
+  const total = run.generated_samples ?? 0;
+  parts.push(
+    (run.verified_samples === null || run.verified_samples === undefined
+      ? `${total} samples, unjudged`
+      : `${run.verified_samples}/${total} verified`).padEnd(21));
+
+  // The run this one's samples came from, so a chain reads off the list.
+  if (run.derived_from) {
+    parts.push(`\u2190 ${handles[run.derived_from] || run.derived_from}`);
+  }
+  return parts.join(' ').trimEnd();
 }
 
 async function loadExistingRuns() {
@@ -326,12 +573,28 @@ async function loadExistingRuns() {
 
   const response = await fetch('/api/runs');
   const data = await response.json();
-  for (const run of data.runs) {
-    const option = el('option', null,
-      `${run.run_id} (${run.verified_samples ?? run.generated_samples ?? 0} samples)`);
+  const handles = runHandles(data.runs);
+
+  // Newest first, on the timestamp rather than the id: ids now carry
+  // _noisy_v2.0 suffixes, and sorting on them would order two runs made in
+  // the same second by their suffix instead of by when they ran.
+  const runs = data.runs.slice().sort(
+    (a, b) => String(b.created_at || '').localeCompare(String(a.created_at || ''))
+  );
+
+  for (const run of runs) {
+    const option = el('option', null, describeRun(run, handles));
     option.value = run.run_id;
+    // The list is short by design; the exact id is a hover away, and also
+    // appears under the select for whichever run is chosen.
+    option.title = run.run_id;
     select.append(option);
   }
+
+  const note = document.getElementById('existing_run_id');
+  const showId = () => { note.textContent = select.value; };
+  select.addEventListener('change', showId);
+  showId();
 }
 
 /* --- CWE chips ------------------------------------------------------- */
@@ -346,7 +609,113 @@ function selectedCwes() {
               .map((chip) => chip.dataset.cwe);
 }
 
-/* --- starting a run --------------------------------------------------- */
+/* --- pick lists ------------------------------------------------------
+   Judges, static and ML tools, and LLM detector models are all chosen the
+   same way: click to select, click again to deselect. One behaviour, one
+   implementation, whatever is being picked.
+
+   A disabled pick -- no API key, package not installed -- cannot be clicked
+   at all. The button carries `disabled`, so the browser swallows the event
+   before it reaches this handler, and there is no second place where
+   "unavailable" has to be remembered. */
+
+function picked(containerId, attribute) {
+  return Array.from(
+    document.querySelectorAll(`#${containerId} .pick.selected`)
+  ).map((button) => button.dataset[attribute]);
+}
+
+/* Judges only: the cap. Enforced by refusing the click that would exceed it
+   rather than by silently dropping the oldest selection -- a cap that moves
+   your earlier choices without saying so is worse than one that says no.
+   The server re-checks; this is the courtesy copy. */
+function onPickClick(event) {
+  const button = event.target.closest('.pick');
+  if (!button || button.disabled) return;
+
+  const list = button.closest('.picklist, .pick-group');
+  const max = Number(list?.dataset.max || 0);
+  const selecting = !button.classList.contains('selected');
+
+  if (selecting && max) {
+    const already = list.querySelectorAll('.pick.selected').length;
+    if (already >= max) {
+      setPickNote(list, `At most ${max}. Deselect one first.`);
+      return;
+    }
+  }
+  button.classList.toggle('selected');
+  setPickNote(list, '');
+  refreshPickCounts();
+}
+
+function setPickNote(list, message) {
+  const field = list.closest('.field');
+  const counter = field?.querySelector('.pick-count');
+  if (!counter) return;
+  counter.classList.toggle('warn', Boolean(message));
+  if (message) counter.textContent = message;
+  else refreshPickCounts();
+}
+
+/* The "n selected" badge beside each list's label. Also the only place that
+   says "none" out loud, which matters for the LLM arm: an empty selection
+   there is a real choice -- skip the arm -- and not a forgotten field. */
+function refreshPickCounts() {
+  const judges = picked('judge-picks', 'model').length;
+  const judgeCount = document.getElementById('judge-count');
+  if (judgeCount) {
+    judgeCount.classList.remove('warn');
+    judgeCount.textContent =
+      judges === 0 ? 'none selected -- labels will not be verified'
+                   : `${judges} of {{ max_judges }} selected`;
+  }
+
+  const llm = picked('llm-picks', 'model').length;
+  const llmCount = document.getElementById('llm-count');
+  if (llmCount) {
+    llmCount.classList.remove('warn');
+    llmCount.textContent =
+      llm === 0 ? 'none selected -- the LLM arm will be skipped'
+                : `${llm} selected`;
+  }
+}
+
+for (const id of ['judge-picks', 'llm-picks']) {
+  document.getElementById(id)?.addEventListener('click', onPickClick);
+}
+/* Tool picks are several separate groups, so the listener goes on the form
+   and filters by the attribute the button carries. */
+document.addEventListener('click', (event) => {
+  if (event.target.closest('.tool-picks')) onPickClick(event);
+});
+refreshPickCounts();
+
+/* --- starting and stopping a run -------------------------------------- */
+
+/* The single button's two modes. 'stop' is set from pollStatus, so the button
+   follows the worker's actual state rather than what was last clicked: if a
+   run ends on its own, or was started from another tab, the button is correct
+   without anything having to tell it. */
+function setRunButtonMode(mode) {
+  const button = document.getElementById('run-btn');
+  if (button.dataset.mode === mode) return;        // nothing to repaint
+  button.dataset.mode = mode;
+  button.disabled = false;
+  if (mode === 'stop') {
+    button.textContent = 'Stop run';
+    button.className = 'danger';
+  } else {
+    button.textContent = 'Run pipeline';
+    button.className = 'primary';
+  }
+}
+
+function onRunButton() {
+  return document.getElementById('run-btn').dataset.mode === 'stop'
+    ? requestStop()
+    : startRun();
+}
 
 async function startRun() {
   const button = document.getElementById('run-btn');
@@ -354,38 +723,47 @@ async function startRun() {
   button.disabled = true;
   note.textContent = 'Starting...';
 
-  const judges = [
-    document.getElementById('judge_a').value,
-    document.getElementById('judge_b').value,
-  ].filter(Boolean);
-
   const body = {
     source: document.getElementById('source').value,
     pairs: Number(document.getElementById('pairs').value),
     generator_model: document.getElementById('generator_model').value,
-    cwe_selection: document.getElementById('cwe_selection').value,
     cwe_subset: selectedCwes(),
     seed: document.getElementById('seed').value,
     do_judge: document.getElementById('do_judge').checked,
-    judge_models: judges,
-    tools: Array.from(document.querySelectorAll('.tool-check:checked'))
-                .map((box) => box.value),
-    llm_models: Array.from(document.getElementById('llm_models').selectedOptions)
-                     .map((option) => option.value),
+    manual_selection: document.getElementById('manual_selection').checked,
+    balance_review: document.getElementById('balance_review').checked,
+    judge_models: picked('judge-picks', 'model'),
+    tools: Array.from(document.querySelectorAll('.tool-picks .pick.selected'))
+                .map((button) => button.dataset.tool),
+    llm_models: picked('llm-picks', 'model'),
     ingest_source: document.getElementById('ingest_source').value,
     max_files: Number(document.getElementById('max_files').value),
     run_id: document.getElementById('existing_run').value,
+    perturb: document.getElementById('perturb').checked,
+    perturb_kinds: Array.from(document.querySelectorAll('.perturb-check:checked'))
+                        .map((box) => box.value),
     label: document.getElementById('label').value,
   };
 
-  const response = await fetch('/api/run', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(body),
-  });
+  let response;
+  try {
+    response = await fetch('/api/run', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+  } catch (err) {
+    // The server is not reachable. Without this branch fetch() rejects, the
+    // async function aborts, and the button stays disabled showing
+    // "Starting..." forever -- which looks exactly like a hung pipeline.
+    note.textContent =
+      'Cannot reach the server. Is "python web/app.py" still running?';
+    button.disabled = false;
+    return;
+  }
 
   if (!response.ok) {
-    const data = await response.json();
+    const data = await response.json().catch(() => ({}));
     note.textContent = data.error || 'Could not start the run.';
     button.disabled = false;
     return;
@@ -394,8 +772,335 @@ async function startRun() {
   note.textContent = 'Running.';
   document.getElementById('progress-card').hidden = false;
   document.getElementById('results-card').hidden = true;
+  document.getElementById('selection-card').hidden = true;
+  selectionRunId = null;                  // a new run gets a fresh list
   startPolling();
 }
+
+/* --- manual sample review ---------------------------------------------
+   The worker parks in the "selecting" state after stage 1 and waits for
+   POST /api/selection. Everything here runs between those two points. */
+
+let selectionRunId = null;    // the run whose list is currently rendered
+let reviewSamples = true;     // whether the sample list is part of this pause
+
+/* Build the list once per run. pollStatus() fires every second while the
+   worker waits, so without this guard the list would be rebuilt under the
+   user's cursor and every tick would discard their checkbox state. */
+async function showSelection(runId, reviewing, balancing) {
+  if (selectionRunId === runId) return;
+  selectionRunId = runId;
+
+  const card = document.getElementById('selection-card');
+  const list = document.getElementById('selection-list');
+  list.replaceChildren();
+  card.hidden = false;
+  document.getElementById('selection-note').textContent = '';
+
+  /* The two halves are independent. Asking only to balance shows the
+     composition and the two steps without the sample list; asking only to
+     review shows the list without them; asking for both is one stop. The
+     flags come from the server rather than from what this page submitted,
+     so a reload mid-pause still shows the right thing. */
+  reviewSamples = reviewing !== false;
+  document.getElementById('selection-list').hidden = !reviewSamples;
+  document.querySelector('.selection-actions').hidden = !reviewSamples;
+  document.getElementById('balance_field').hidden = balancing === false;
+  document.getElementById('selection-heading').textContent =
+    reviewSamples ? 'Review samples' : 'Balance the dataset';
+
+  let data;
+  try {
+    const response = await fetch(`/api/runs/${runId}/samples`);
+    data = await response.json();
+  } catch (err) {
+    document.getElementById('selection-note').textContent =
+      'Could not load the samples.';
+    selectionRunId = null;              // let the next poll try again
+    return;
+  }
+
+  const samples = data.samples || [];
+  for (const sample of samples) list.append(sampleRow(runId, sample, data));
+  updateSelectionCount(data);
+}
+
+/* One sample: a checkbox and a summary line that opens to show the code.
+   The code is fetched on first open, not up front -- a 60-sample run would
+   otherwise pull every program before the user looks at any of them. */
+function sampleRow(runId, sample, data) {
+  const row = el('details', 'fold sample-row');
+  // Only ever present on a run generated before paired generation was
+  // removed, and read nowhere now. Kept on the element because such a run
+  // can still be re-analysed and its id is worth seeing in the DOM.
+  if (sample.pair_id) row.dataset.pair = sample.pair_id;
+  const summary = el('summary');
+
+  const box = el('input');
+  box.type = 'checkbox';
+  /* Start from the most recent decision there is: a previous review of this
+     run, else the judges' verdict, else everything. Starting from the judges
+     is what makes reviewing AFTER judging useful -- the default is already the
+     dataset that would be used, and the reviewer only touches the cases they
+     disagree with, in either direction. */
+  box.checked = data.reviewed ? sample.selected
+              : data.judged   ? sample.admitted
+              : true;
+  box.className = 'sample-check';
+  box.dataset.id = sample.id;
+  box.dataset.label = sample.label;
+  // Read by the composition line under the balancing checkboxes, so the cost
+  // of evening out the classes is visible before the choice is made.
+  box.dataset.cwe = sample.cwe || '';
+  box.dataset.admitted = String(sample.admitted);
+  // Without this the browser treats the click as a click on the summary and
+  // toggles the disclosure, so ticking a box would expand the code.
+  box.addEventListener('click', (event) => event.stopPropagation());
+  box.addEventListener('change', updateSelectionCount);
+
+  const vulnerable = sample.label === 'vulnerable';
+  summary.append(
+    box,
+    el('span', 'mono sample-id', sample.id),
+    el('span', 'pill ' + (vulnerable ? 'pill-vuln' : 'pill-safe'),
+       vulnerable ? 'vulnerable' : 'safe'),
+  );
+  // The judges' decision belongs on the row, not only in the checkbox: a
+  // reviewer overriding one should be able to see that is what they are doing.
+  if (data.judged) {
+    summary.append(el('span', 'pill ' + (sample.admitted ? 'pill-ok' : 'pill-no'),
+                      sample.admitted ? 'admitted' : 'judged out'));
+  }
+  summary.append(
+    el('span', 'fold-note',
+       [sample.cwe, sample.cwe_name, sample.difficulty, sample.context]
+         .filter(Boolean).join(' · ')),
+  );
+  row.append(summary);
+
+  const body = el('div', 'fold-body');
+  // Why each judge decided as it did, above the code, since that is what the
+  // reviewer is being asked to agree or disagree with.
+  const verdicts = sample.judge_verdicts || {};
+  for (const [model, verdict] of Object.entries(verdicts)) {
+    if (!verdict) continue;
+    const reasons = (verdict.reasons || []).join(', ');
+    const line = el('p', 'verdict-line');
+    line.append(
+      el('span', 'mono', model + ': '),
+      el('span', verdict.agrees ? 'ok' : 'bad',
+         verdict.agrees ? 'agrees' : 'disagrees'),
+      el('span', 'muted',
+         ` · said ${verdict.predicted_label || 'nothing'}`
+         + (verdict.predicted_cwe ? ` (${verdict.predicted_cwe})` : '')
+         + ` · confidence ${Number(verdict.confidence || 0).toFixed(2)}`
+         + (reasons ? ` · ${reasons}` : '')),
+    );
+    body.append(line);
+    if (verdict.reasoning) body.append(el('p', 'muted small', verdict.reasoning));
+  }
+
+  const pre = el('pre', 'code');
+  pre.textContent = 'Loading...';
+  body.append(pre);
+  if (sample.note) body.append(el('p', 'muted', sample.note));
+  row.append(body);
+
+  let loaded = false;
+  row.addEventListener('toggle', async () => {
+    if (!row.open || loaded) return;
+    loaded = true;
+    try {
+      const response = await fetch(`/api/runs/${runId}/sample/${sample.id}`);
+      pre.textContent = (await response.json()).code || '(empty)';
+    } catch (err) {
+      pre.textContent = 'Could not load this sample.';
+      loaded = false;                   // allow a retry on the next open
+    }
+  });
+
+  return row;
+}
+
+function sampleBoxes() {
+  return Array.from(document.querySelectorAll('.sample-check'));
+}
+
+/* Keeps the header count current, and the composition line under the
+   balancing steps with it: what those steps would have to even out is a
+   property of the set as it stands at this moment, not of the run. */
+let selectionData = {};
+
+function updateSelectionCount(data) {
+  if (data) selectionData = data;
+  const boxes = sampleBoxes();
+  const kept = boxes.filter((box) => box.checked);
+  const vuln = kept.filter((box) => box.dataset.label === 'vulnerable').length;
+
+  // Overrides in both directions, counted separately: keeping a sample the
+  // judges rejected puts a label into the dataset no judge agreed with, which
+  // is a different thing from dropping one they accepted.
+  const restored = kept.filter((b) => b.dataset.admitted === 'false').length;
+  const removed = boxes.filter(
+    (b) => !b.checked && b.dataset.admitted === 'true').length;
+
+  document.getElementById('selection-count').textContent =
+    `${kept.length} of ${boxes.length}`;
+
+  let text = `Keeping ${kept.length} samples: ${vuln} vulnerable, `
+           + `${kept.length - vuln} safe.`;
+  if (selectionData.judged) {
+    text += ` Overriding the judges on ${restored + removed}`
+          + ` (${restored} restored, ${removed} removed).`;
+  }
+  /* The rows are built either way -- the kept set is read off them even
+     when the list is hidden -- so the invitation to click one is added only
+     when there is something to click. */
+  document.getElementById('selection-intro').textContent =
+    reviewSamples ? text + ' Click a row for its verdicts and code.'
+                  : text + ' Choose how to balance it, then continue.';
+
+  /* What the kept set currently looks like, which is what stage 2c would
+     have to even out. Descriptive only -- the sizes are read off the rows,
+     not a reimplementation of balance.py's algorithm, which decides the
+     target and reports it in the log. */
+  const classes = new Map();
+  for (const b of kept) {
+    const cwe = b.dataset.cwe || '(none)';
+    if (!classes.has(cwe)) classes.set(cwe, 0);
+    classes.set(cwe, classes.get(cwe) + 1);
+  }
+  const sizes = Array.from(classes.values());
+  const composition = document.getElementById('balance-composition');
+  if (!kept.length) {
+    composition.textContent = 'Nothing kept yet.';
+  } else {
+    const gap = Math.abs(vuln - (kept.length - vuln));
+    const share = (100 * vuln / kept.length).toFixed(1);
+    composition.textContent =
+      `${kept.length} kept: ${share}% vulnerable`
+      + (gap ? ` (gap ${gap})` : ' (even)')
+      + ` \u00b7 ${classes.size} class(es), `
+      + `smallest ${Math.min(...sizes)}, largest ${Math.max(...sizes)}.`;
+  }
+
+  /* The split-pair warning that stood here is gone with paired generation:
+     samples are independent, so there is no control twin for keeping one
+     half of a pair to break. A run made before that change still carries
+     pair_ids, but it is read, not generated, and nothing here can split one
+     that the judging it has already been through did not. */
+  document.getElementById('selection-warning').hidden = true;
+  document.getElementById('selection-continue').disabled = kept.length === 0;
+}
+
+function setAll(predicate) {
+  for (const box of sampleBoxes()) box.checked = predicate(box);
+  updateSelectionCount();
+}
+
+// Back to exactly what the judges decided, discarding every override.
+document.getElementById('sel-judged').addEventListener('click',
+  () => setAll((box) => box.dataset.admitted === 'true'));
+document.getElementById('sel-all')
+        .addEventListener('click', () => setAll(() => true));
+document.getElementById('sel-none')
+        .addEventListener('click', () => setAll(() => false));
+document.getElementById('sel-invert')
+        .addEventListener('click', () => setAll((box) => !box.checked));
+document.getElementById('sel-vuln').addEventListener('click',
+  () => setAll((box) => box.dataset.label === 'vulnerable'));
+document.getElementById('sel-safe').addEventListener('click',
+  () => setAll((box) => box.dataset.label !== 'vulnerable'));
+
+/* Asks the worker to stop. It keeps polling afterwards: the job does not
+   end at the click, it ends when the stage in flight reaches a safe point,
+   and the log is where that becomes visible. */
+async function requestStop() {
+  const button = document.getElementById('run-btn');
+  const note = document.getElementById('stop-note');
+  // Disabled, not switched back to 'run': the job is still running, and
+  // offering "Run pipeline" here would only earn a 409. pollStatus restores
+  // the button when the worker actually lets go.
+  button.disabled = true;
+  note.hidden = false;
+  note.textContent =
+    'Stopping. The stage running now finishes what it has in flight first '
+    + '-- generation stops after the request in progress, judging after the '
+    + 'current judge, detection after the current detector -- so that the run '
+    + 'is left in a state later stages can read. Whatever has been produced '
+    + 'is kept.';
+
+  let response;
+  try {
+    response = await fetch('/api/stop', {method: 'POST'});
+  } catch (err) {
+    note.textContent = 'Cannot reach the server.';
+    button.disabled = false;
+    return;
+  }
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    note.textContent = data.error || 'Could not stop the run.';
+    button.disabled = false;
+  }
+}
+
+/* Asked for by the browser when the tab is closing mid-run. Without it a
+   generation left running in the background keeps the worker busy, and the
+   next page load is refused with "a run is already in progress" by a job
+   nobody is watching. */
+window.addEventListener('beforeunload', (event) => {
+  if (document.getElementById('run-btn').dataset.mode === 'stop') {
+    event.preventDefault();
+    event.returnValue = '';
+  }
+});
+
+async function submitSelection(cancel) {
+  const note = document.getElementById('selection-note');
+  /* With the list hidden the user was never asked which samples to keep, so
+     the answer is "the ones the judges admitted" -- which is what the boxes
+     were initialised to. Reading them either way means there is one source
+     of truth for the kept set, rather than a second rule for the
+     balance-only case that could drift from the first. */
+  const keep = sampleBoxes().filter((b) => b.checked).map((b) => b.dataset.id);
+  note.textContent = cancel ? 'Cancelling...' : 'Continuing...';
+
+  /* Stage 2c travels with the selection, not with the run configuration:
+     balancing acts on exactly this kept set, so the two decisions are
+     submitted together and cannot be applied to different sets. */
+  const body = cancel ? {cancel: true} : {
+    keep,
+    balance_labels: document.getElementById('balance_labels').checked,
+    balance_classes: document.getElementById('balance_classes').checked,
+  };
+
+  let response;
+  try {
+    response = await fetch('/api/selection', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+  } catch (err) {
+    note.textContent = 'Cannot reach the server.';
+    return;
+  }
+
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    note.textContent = data.error || 'Could not submit the selection.';
+    return;
+  }
+
+  document.getElementById('selection-card').hidden = true;
+  note.textContent = '';
+}
+
+document.getElementById('selection-continue')
+        .addEventListener('click', () => submitSelection(false));
+document.getElementById('selection-cancel')
+        .addEventListener('click', () => submitSelection(true));
 
 function startPolling() {
   if (pollTimer) clearInterval(pollTimer);
@@ -403,25 +1108,176 @@ function startPolling() {
   pollTimer = setInterval(pollStatus, POLL_INTERVAL_MS);
 }
 
+/* Rounds a number of seconds to the coarsest unit that still says something
+   useful. An ETA quoted to the second on a forty-minute stage is false
+   precision: the estimate is drawn from the rate so far, and the endpoint's
+   latency moves under it. */
+function humanDuration(seconds) {
+  if (seconds === null || seconds === undefined) return '';
+  if (seconds < 60) return `${Math.max(1, Math.round(seconds))}s`;
+  if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
+  const hours = Math.floor(seconds / 3600);
+  return `${hours}h ${Math.round((seconds % 3600) / 60)}m`;
+}
+
+/* Draws the counter for whichever model is working.
+
+   `progress` is null between units of work -- after one judge finishes and
+   before the next starts -- and throughout any stage with nothing to count,
+   such as the static analysers, which run one subprocess over the whole
+   sample directory. Hiding it then is deliberate: the alternative is a full
+   bar sitting under a stage that has already moved on, which is exactly the
+   "has this hung?" question the meter exists to answer. */
+function renderProgress(progress) {
+  const meter = document.getElementById('progress-meter');
+  if (!progress || !progress.total) {
+    meter.hidden = true;
+    return;
+  }
+
+  const done = progress.done || 0;
+  const percent = Math.min(100, Math.round(100 * done / progress.total));
+
+  const parts = [`${done} / ${progress.total} ${progress.unit || ''}`.trim()];
+  if (progress.elapsed_seconds) {
+    parts.push(`${humanDuration(progress.elapsed_seconds)} elapsed`);
+  }
+  if (progress.eta_seconds) {
+    parts.push(`~${humanDuration(progress.eta_seconds)} left`);
+  }
+
+  document.getElementById('progress-label').textContent = progress.label || '';
+  document.getElementById('progress-count').textContent =
+    `${parts.join('  --  ')}  (${percent}%)`;
+  document.getElementById('progress-fill').style.width = `${percent}%`;
+  meter.hidden = false;
+}
+
 async function pollStatus() {
-  const response = await fetch('/api/status');
-  const data = await response.json();
+  let data;
+  try {
+    const response = await fetch('/api/status');
+    data = await response.json();
+  } catch (err) {
+    // Stop polling and say so, rather than retrying silently every second
+    // against a server that has gone away.
+    clearInterval(pollTimer);
+    pollTimer = null;
+    setRunButtonMode('run');
+    document.getElementById('run-note').textContent =
+      'Lost contact with the server. The run may still be going -- restart '
+      + 'the app and reload this page to reattach.';
+    return;
+  }
 
   const badge = document.getElementById('state-badge');
   badge.textContent = data.state;
   badge.className = 'badge ' + data.state;
 
+  setRunButtonMode(RUNNING_STATES.includes(data.state) ? 'stop' : 'run');
+
+  renderProgress(data.progress);
+
   const log = document.getElementById('log');
   log.textContent = data.log.join('\n');
   log.scrollTop = log.scrollHeight;                 // follow the tail
 
-  if (data.state === 'done' || data.state === 'error' || data.state === 'idle') {
+  // Parked between generation and judging: show the list and keep polling,
+  // because the worker resumes as soon as the selection is posted.
+  if (data.state === 'selecting' && data.run_id) {
+    showSelection(data.run_id, data.reviewing, data.balancing);
+  } else if (data.state !== 'selecting') {
+    document.getElementById('selection-card').hidden = true;
+  }
+
+  if (['done', 'error', 'idle', 'stopped'].includes(data.state)) {
     clearInterval(pollTimer);
     pollTimer = null;
-    document.getElementById('run-btn').disabled = false;
+    setRunButtonMode('run');
+    document.getElementById('stop-note').hidden = data.state !== 'stopped';
+    if (data.state === 'stopped') {
+      document.getElementById('stop-note').textContent =
+        'Stopped. Whatever each stage had finished is on disk; the log above '
+        + 'says where it stopped.';
+    }
     document.getElementById('run-note').textContent =
-      data.state === 'error' ? (data.error || 'Failed.') : 'Finished.';
-    if (data.state === 'done' && data.run_id) loadReport(data.run_id);
+      data.state === 'error' ? (data.error || 'Failed.')
+      : data.state === 'stopped' ? 'Stopped.'
+      : 'Finished.';
+    // A stopped run still has results for the stages that completed, and
+    // evaluation runs on them, so its report is worth loading.
+    if (['done', 'stopped'].includes(data.state) && data.run_id) {
+      loadReport(data.run_id);
+    }
+  }
+}
+
+const COMPARISON_COLUMNS = ['Detector', 'Arm', 'TP', 'FP', 'FN', 'TN', 'Accuracy', 'Precision',
+       'Recall', 'F1', 'FPR', 'FNR', 'MCC', "Youden J", 'CWE id.'];
+
+/* --- comparison blocks -------------------------------------------------
+   Renders one earlier result set beneath the current one, with a trailing
+   column giving the F1 change from it to now. Used for both a previous
+   detection pass over the same samples and the clean run a perturbed run was
+   derived from -- they differ only in the heading. */
+function appendComparisonTable(host, heading, subtitle, rows, currentByName) {
+  // Folded shut: the current pass is what is being read, and an earlier one
+  // is opened deliberately when the change is in question.
+  const block = fold(host, heading, subtitle, false);
+
+  const table = el('table');
+  const wrap = el('div', 'scroll');
+  wrap.append(table);
+  block.append(wrap);
+
+  buildTable(table,
+    COMPARISON_COLUMNS.concat(['F1 \u2192 now']),
+    rows.map((row) => {
+      const now = currentByName[row.name];
+      // A detector absent from the current pass has nothing to compare
+      // against; an em dash says so rather than implying a change of zero.
+      const delta = now ? fmt(now.f1 - row.f1) : '\u2014';
+      const cls = !now ? 'muted'
+        : (now.f1 - row.f1) < -0.001 ? 'wrong'
+        : (now.f1 - row.f1) > 0.001 ? 'ok' : 'muted';
+      return [
+        {text: row.name, className: 'strong'}, row.arm,
+        row.tp, row.fp, row.fn, row.tn,
+        fmt(row.accuracy), fmt(row.precision), fmt(row.recall),
+        fmt(row.f1), fmt(row.fpr), fmt(row.fnr), fmt(row.mcc),
+        fmt(row.youden_j), fmt(row.cwe_accuracy),
+        {text: delta, className: cls},
+      ];
+    }));
+}
+
+/* Everything earlier than the current pass, newest first, plus the run this
+   one was derived from when there is one. */
+function appendComparisons(host, report) {
+  const currentByName = {};
+  for (const row of report.ranking) currentByName[row.name] = row;
+
+  for (const entry of (report.rounds || [])) {
+    if (entry.is_current) continue;
+    // The round id ends in the local time the pass ran, so it is the
+    // timestamp shown; archived_at is UTC and would contradict it.
+    let subtitle = [entry.round_id, entry.label,
+                    `${entry.sample_count} samples`]
+      .filter(Boolean).join('  \u00b7  ');
+    if (entry.comparable === false) {
+      subtitle += '  \u2014  NOT directly comparable: scored on a different '
+                + 'admitted sample set, the run was re-judged in between.';
+    }
+    appendComparisonTable(host, 'Earlier pass', subtitle,
+                          entry.detectors, currentByName);
+  }
+
+  if (report.baseline) {
+    const b = report.baseline;
+    const subtitle = `${b.run_id}  \u00b7  clean samples, before `
+      + (b.perturbations || []).join(', ');
+    appendComparisonTable(host, 'Baseline run', subtitle,
+                          b.detectors, currentByName);
   }
 }
 
@@ -457,37 +1313,31 @@ function renderReport(report, runId) {
     summary.append(box);
   }
 
-  const weights = report.composite_weights;
   document.getElementById('weights-note').textContent =
-    `composite = ${weights.f1}*F1 + ${weights.tnr}*(1-FPR) + ${weights.cwe}*CWE accuracy`;
+    'Standard metrics per detector. Ordered by F1 for readability -- that is '
+    + 'a sort order, not a score, so read the whole row.';
 
   buildTable(
     document.getElementById('ranking-table'),
-    ['#', 'Detector', 'Arm', 'Composite', 'F1', 'MCC', 'FPR', 'CWE id.'],
+    ['Detector', 'Arm', 'TP', 'FP', 'FN', 'TN', 'Accuracy', 'Precision',
+     'Recall', 'F1', 'FPR', 'FNR', 'MCC', "Youden J", 'CWE id.'],
     report.ranking.map((row) => [
-      row.rank,
       {text: row.name, className: 'strong'},
       row.arm,
-      {text: fmt(row.composite), className: 'strong'},
-      fmt(row.f1), fmt(row.mcc), fmt(row.fpr), fmt(row.cwe_accuracy),
+      row.tp, row.fp, row.fn, row.tn,
+      fmt(row.accuracy), fmt(row.precision), fmt(row.recall),
+      {text: fmt(row.f1), className: 'strong'},
+      fmt(row.fpr), fmt(row.fnr), fmt(row.mcc), fmt(row.youden_j),
+      fmt(row.cwe_accuracy),
     ]),
   );
 
-  buildTable(
-    document.getElementById('metrics-table'),
-    ['Detector', 'TP', 'FP', 'TN', 'FN', 'Accuracy', 'Precision', 'Recall',
-     'F1', 'FPR', 'FNR', 'MCC', "Youden J", 'CWE id.'],
-    report.detectors.map((detector) => {
-      const m = detector.metrics;
-      return [
-        {text: detector.name, className: 'strong'},
-        m.tp, m.fp, m.tn, m.fn,
-        fmt(m.accuracy), fmt(m.precision), fmt(m.recall), fmt(m.f1),
-        fmt(m.fpr), fmt(m.fnr), fmt(m.mcc), fmt(m.youden_j),
-        fmt(m.cwe_accuracy),
-      ];
-    }),
-  );
+  document.getElementById('results-note').textContent =
+    `${report.ranking.length} detectors`;
+
+  const comparisons = document.getElementById('comparison-blocks');
+  comparisons.replaceChildren();
+  appendComparisons(comparisons, report);
 
   buildTable(
     document.getElementById('agreement-table'),
@@ -501,19 +1351,36 @@ function renderReport(report, runId) {
 
 /* --- startup ---------------------------------------------------------- */
 
-document.getElementById('run-btn').addEventListener('click', startRun);
+document.getElementById('run-btn').addEventListener('click', onRunButton);
+setRunButtonMode('run');
+/* The transformation list is meaningless until the box is ticked, so it is
+   greyed out rather than left looking configurable. */
+function syncPerturbFields() {
+  const on = document.getElementById('perturb').checked;
+  document.getElementById('perturb-kinds').style.opacity = on ? '1' : '0.45';
+  document.querySelectorAll('.perturb-check')
+    .forEach((box) => { box.disabled = !on; });
+}
+
+document.getElementById('perturb').addEventListener('change', syncPerturbFields);
 document.getElementById('source').addEventListener('change', syncSourceFields);
 syncSourceFields();
 
 /* Recover an in-flight run if the page was refreshed mid-job. */
 (async () => {
-  const response = await fetch('/api/status');
-  const data = await response.json();
-  const running = ['starting', 'generating', 'ingesting', 'judging',
-                   'detecting', 'evaluating'].includes(data.state);
-  if (running) {
+  let data;
+  try {
+    const response = await fetch('/api/status');
+    data = await response.json();
+  } catch (err) {
+    return;                                         // server down; nothing to resume
+  }
+  // 'selecting' counts as running: the worker is alive and parked, and a
+  // refreshed page has to show the list again or the run has no way to resume.
+  if (RUNNING_STATES.includes(data.state)) {
     document.getElementById('progress-card').hidden = false;
-    document.getElementById('run-btn').disabled = true;
+    // startPolling's first poll sets the button to 'stop', so a refreshed
+    // page can stop a run it did not start.
     startPolling();
   } else if (data.state === 'done' && data.run_id) {
     document.getElementById('progress-card').hidden = false;

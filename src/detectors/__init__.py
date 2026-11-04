@@ -7,8 +7,10 @@ THREE PARADIGMS, ONE INTERFACE
         arm       module            tools
         --------  ----------------  ------------------------------------------
         static    static_tools.py   Bandit, Ruff, Semgrep
-        ml        ml_models.py      TF-IDF + Logistic Regression,
-                                    Embedding + Logistic Regression
+        ml        ml_models.py      pretrained: BiLSTM (Farasat & Posegga
+                                    2024), LSTM (VUDENC 2022);
+                                    trained here: TF-IDF + LogReg,
+                                    embeddings + LogReg
         llm       llm_tools.py      any chat model, local or remote
 
     Every detector -- however it works internally -- returns the same result
@@ -86,15 +88,52 @@ DETECTOR_REGISTRY: dict[str, dict] = {
     },
 
     # --- Arm 2: machine learning -------------------------------------------
+    # Both are published, frozen models that have never seen this benchmark's
+    # data, so unlike the classifiers they replaced they are scored on exactly
+    # the same protocol as the static and LLM arms -- asked, not trained.
+    "ml_farasat": {
+        "key": "ml_farasat",
+        "name": "BiLSTM (Farasat & Posegga 2024)",
+        "arm": "ml",
+        "needs": "pretrained-weights",
+        "blurb": (
+            "A bidirectional LSTM over word2vec embeddings, trained at the "
+            "Chair of IT Security in Passau on security-fix commits from "
+            "thousands of real Python projects. Slides a context window across "
+            "the file and scores each position, so it localises a weakness "
+            "rather than labelling the file as a whole."
+        ),
+    },
+    "ml_vudenc": {
+        "key": "ml_vudenc",
+        "name": "LSTM (VUDENC 2022)",
+        "arm": "ml",
+        "needs": "pretrained-weights",
+        "blurb": (
+            "The model the Passau BiLSTM builds on: same corpus, same "
+            "preprocessing, a single LSTM layer instead of a deeper "
+            "bidirectional stack. Running both measures what the architecture "
+            "change bought, on data neither author chose."
+        ),
+    },
+
+    # The trained pair. Unlike everything else in this registry these learn
+    # from the run they are scored on, so their predictions are made out of
+    # fold and their numbers are NOT on the same protocol as the rest. They
+    # are kept because they measure a property of the benchmark -- how much
+    # signal is learnable from the samples themselves -- which no pretrained
+    # or unsupervised tool can report.
     "ml_tfidf": {
         "key": "ml_tfidf",
         "name": "TF-IDF + Logistic Regression",
         "arm": "ml",
         "needs": "sklearn",
         "blurb": (
-            "Lexical baseline. Character and token n-grams over the raw source, "
-            "classified by logistic regression. Learns which *tokens* co-occur "
-            "with vulnerability, with no understanding of data flow."
+            "Lexical baseline, trained on this run. Character and token "
+            "n-grams over the raw source, classified by logistic regression "
+            "with every prediction made out of fold. Scoring well here means "
+            "the generator left surface giveaways; scoring at chance means "
+            "the samples are lexically balanced."
         ),
     },
     "ml_embedding": {
@@ -103,10 +142,11 @@ DETECTOR_REGISTRY: dict[str, dict] = {
         "arm": "ml",
         "needs": "embedding-api",
         "blurb": (
-            "Semantic counterpart to the lexical baseline. Each program is "
-            "embedded by a neural code embedding model, then classified by the "
-            "same logistic regression, so the only thing that differs between "
-            "the two ML detectors is the representation."
+            "Semantic counterpart to the lexical baseline, also trained on "
+            "this run. Each program becomes one dense vector from a neural "
+            "code-embedding model, then goes to the same logistic regression "
+            "-- so the only thing that differs between the two is the "
+            "representation."
         ),
     },
 
@@ -123,6 +163,37 @@ DETECTOR_REGISTRY: dict[str, dict] = {
         ),
     },
 }
+
+# Detectors registered in models.local.json, so a model added on this
+# installation appears in the Tools panel and in the tool checkboxes.
+#
+# Reads the overlay JSON only. This module is imported by the web layer purely
+# to render that panel, and the comment on detect.py's RUNNERS explains why it
+# must not pull in tensorflow or scikit-learn -- so the ML *families* are read
+# from the registry here, and the runner that actually loads weights is built
+# in detect.py instead.
+try:
+    import model_registry as _registry
+
+    for _key, _spec in _registry.ml_families().items():
+        if _key in DETECTOR_REGISTRY:
+            continue
+        DETECTOR_REGISTRY[_key] = {
+            "key": _key,
+            "name": _spec["label"],
+            "arm": "ml",
+            "needs": "models-dir",
+            "blurb": (
+                "Registered on this installation, not shipped with the "
+                "framework. A pretrained word2vec + recurrent family loaded "
+                f"from models/{_spec['directory']} with "
+                f"{_spec['dimensions']}-dimensional embeddings."
+                + (f" {_spec['citation']}" if _spec.get("citation") else "")
+            ),
+            "user_registered": True,
+        }
+except Exception as _exc:                                    # noqa: BLE001
+    print(f"WARNING: registered detectors not listed ({_exc})")
 
 # Display names for the three arms, used as section headings in the UI.
 ARM_NAMES = {
@@ -174,7 +245,8 @@ def build_result(detector_key: str, predictions: list[dict],
 
 def make_prediction(sample_id: str, is_vulnerable: bool,
                     cwe: str | None = None, confidence: float = 0.5,
-                    reasoning: str = "") -> dict:
+                    reasoning: str = "",
+                    lines: list[int] | None = None) -> dict:
     """Build one prediction entry in the common shape.
 
     Args:
@@ -186,6 +258,13 @@ def make_prediction(sample_id: str, is_vulnerable: bool,
             value; see each module for what it uses and why.
         reasoning: short human-readable justification, recorded for inspection
             but never scored.
+        lines: 1-based line numbers the detector is pointing at, if it can say.
+            Scored against the manifest's `vulnerable_lines` where both exist;
+            see "LOCALISATION" in evaluate.py. An empty list is meaningful and
+            is not the same as being wrong: it records that the detector gave
+            a verdict without a location, which evaluate.py reports separately
+            so a tool is never marked as mislocating something it never
+            claimed to locate.
     """
     return {
         "id": sample_id,
@@ -195,4 +274,9 @@ def make_prediction(sample_id: str, is_vulnerable: bool,
         "predicted_cwe": cwe if is_vulnerable else None,
         "confidence": round(float(confidence), 4),
         "reasoning": reasoning,
+        # Only on a positive verdict: a file called clean has no site.
+        "predicted_lines": (
+            sorted({int(n) for n in lines if n})
+            if is_vulnerable and lines else []
+        ),
     }
