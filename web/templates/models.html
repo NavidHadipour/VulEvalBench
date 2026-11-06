@@ -152,6 +152,33 @@
       </small>
     </label>
 
+    <label class="field">
+      <span class="field-label">API model name <span class="muted">(optional)</span></span>
+      <input type="text" name="api_model"
+             placeholder="meta/llama-4-scout-17b-16e-instruct">
+      <small>
+        Only when the endpoint names the model differently from the id above
+        &mdash; which is the normal case on an aggregator, where ids are
+        namespaced like <code>qwen/qwen3-coder-480b-a35b-instruct</code>. A
+        slash cannot go in the id, because the id reaches a filename; it goes
+        here instead, and the id stays the short local handle you see in
+        menus and reports. Leave blank to send the id itself.
+      </small>
+    </label>
+
+    <label class="field">
+      <span class="field-label">Response budget <span class="muted">(optional)</span></span>
+      <input type="number" name="max_tokens" min="1" placeholder="4000">
+      <small>
+        Output tokens this model may use per call, overriding the stage
+        default. Worth setting for a model that reasons before answering:
+        <code>gemma4-31b-it</code> writes a verdict in about 610 tokens, while
+        a reasoning model can spend 6,000&ndash;8,000 thinking first and
+        returns an empty response if it is cut off. Leave blank unless a model
+        actually needs it.
+      </small>
+    </label>
+
     <p class="hint">
       The three fields below apply only to an <code>ml</code> model: a
       pretrained word2vec&nbsp;+&nbsp;recurrent family loaded from a directory

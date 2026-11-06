@@ -412,10 +412,18 @@ def build_rounds(run, manifest: list[dict], current: list[dict],
 
     # The pass's own note -- its tool selection -- in preference to a generic
     # one, since that is what distinguishes it from the passes beneath it.
-    current_label = (
-        archive.get(current_round_id, {}).get("label") or "latest pass"
-        if current_round_id else "latest pass"
-    )
+    #
+    # An empty current pass is named for what it is. The pass ran judging only,
+    # so there is nothing to show at the top and the archive below holds every
+    # set of numbers this run has; saying "latest pass" over an empty table
+    # would read as a failure rather than as a selection.
+    if not current:
+        current_label = "no detectors selected -- run detection to score them"
+    elif current_round_id:
+        current_label = (archive.get(current_round_id, {}).get("label")
+                         or "latest pass")
+    else:
+        current_label = "latest pass"
 
     rounds = [{
         "round_id": "current",
@@ -567,6 +575,7 @@ def build_report(run_id: str) -> dict:
     """
     run = runstore.load_run(run_id)
     manifest = run.read_verified_manifest()
+    meta = run.metadata()
 
     # "This pass" is the newest archived round -- the tools the last detection
     # run actually produced -- and NOT the flat detection directory, which
@@ -575,21 +584,42 @@ def build_report(run_id: str) -> dict:
     # twelve of them scored against a manifest they were never run on and
     # distinguishable only by a coverage figure.
     #
-    # The fallback is for a run detected before rounds were recorded, which
-    # has no archive to read; it keeps those runs evaluating exactly as they
-    # did. An empty round falls back too, so a pass whose archive could not be
-    # read is not reported as having produced nothing.
-    current_round = run.latest_detection_round()
+    # A pass that selected no detectors archives no round at all, so the
+    # newest round then belongs to an EARLIER pass. Judging sets
+    # `detection_stale_after_judging` whenever results from before it are
+    # still on disk, and detection clears it again, which makes the flag an
+    # answer to exactly the question asked here: is the newest round still the
+    # pass that just ran? When it is not, this pass has no detectors and says
+    # so. Re-judging a run with no tools selected used to report the previous
+    # five under a heading reading "this pass", every one of them marked STALE
+    # because they had been scored against labels they never saw.
+    detection_stale = bool(meta.get("detection_stale_after_judging"))
+    archive = run.list_detection_rounds()
+    current_round = (None if detection_stale
+                     else (archive[0] if archive else None))
     current_round_id = current_round["round_id"] if current_round else None
     results = (run.detection_results_for_round(current_round_id)
                if current_round_id else [])
-    if not results:
+
+    # The fallback is for a run detected before rounds were recorded, which
+    # has no archive to read; it keeps those runs evaluating exactly as they
+    # did. An empty round falls back too, so a pass whose archive could not be
+    # read is not reported as having produced nothing. It is skipped when the
+    # results are known to predate the current labels -- that is the one case
+    # where the flat directory holds no answer worth showing as current.
+    if not results and not detection_stale:
         current_round_id = None
         results = run.detection_results()
 
+    # True when detection has to be re-run before there are current numbers:
+    # either nothing has been detected since the last judging pass, or nothing
+    # ever was. Carried in the report so the page and the text report can say
+    # why the current pass is empty instead of rendering an empty table.
+    detection_pending = not results
+
     if not manifest:
         raise SystemExit(f"Run {run_id} has no samples to score.")
-    if not results:
+    if not results and not archive:
         raise SystemExit(
             f"Run {run_id} has no detector results. Run 'python src/detect.py "
             f"{run_id}' first."
@@ -601,7 +631,6 @@ def build_report(run_id: str) -> dict:
     vulnerable = sum(
         1 for e in labelled if e["label"] == config.LABEL_VULNERABLE
     )
-    meta = run.metadata()
 
     dataset = {
         "run_id": run_id,
@@ -642,6 +671,14 @@ def build_report(run_id: str) -> dict:
         )
         coverage = safe_div(covered, len(labelled))
 
+        # An unlabelled run -- ingested code that was never judged -- has no
+        # samples to cover, so `safe_div` returns 0.0 and every detector looked
+        # STALE on a run where staleness cannot arise. The marker tells the
+        # reader to re-run detection, which would change nothing: what is
+        # missing is ground truth, not verdicts. Said once by the unlabelled
+        # note in the report instead.
+        stale = bool(labelled) and coverage < 1.0
+
         # A detector may carry a second prediction set scored under the strict
         # exact-CWE policy (the static tools do). Scoring both means the
         # hierarchy rule -- which was added after it was seen to disadvantage a
@@ -653,7 +690,7 @@ def build_report(run_id: str) -> dict:
         detectors.append({
             "coverage": coverage,
             "covered_samples": covered,
-            "is_stale": coverage < 1.0,
+            "is_stale": stale,
             "metrics_strict": metrics_strict,
             "name": result["detector"],
             "key": result.get("detector_key", ""),
@@ -706,6 +743,7 @@ def build_report(run_id: str) -> dict:
     return {
         "run": meta,
         "dataset": dataset,
+        "detection_pending": detection_pending,
         "detectors": detectors,
         "ranking": [
             {
@@ -819,6 +857,17 @@ def render_report(report: dict) -> str:
         out.append("        formulas divide by zero. The pairwise agreement")
         out.append("        section below IS valid -- it needs no reference")
         out.append("        answer -- as is each tool's raw flag rate.")
+
+    # Said once, at the top. Every per-detector block below is empty in this
+    # case, and a reader who scrolled straight to an absent table would have
+    # no way to tell "nothing ran" from "the report broke".
+    if report.get("detection_pending"):
+        out.append("")
+        out.append("  NOTE: no detector has run against the current labels,")
+        out.append("        so this pass has no scores. Any earlier pass is")
+        out.append("        listed below, measured on the sample set that was")
+        out.append("        admitted at the time. Run detection for this run")
+        out.append("        to score the tools on the labels in force now.")
 
     # --- per-detector blocks ------------------------------------------------
     for detector in report["detectors"]:

@@ -1115,14 +1115,49 @@ def chat_json(provider: str, model: str, system: str, user: str,
         ProviderError: on an unknown provider, an unreachable backend, or a
             response that cannot be parsed as JSON.
     """
+    # A registered per-model budget overrides the stage's default, because one
+    # constant cannot fit both kinds of model: a verdict costs gemma4-31b-it
+    # about 610 output tokens, while qwen-agentworld-35b-a3b spends 6,200-8,000
+    # reasoning before it writes any JSON and returned an empty string on 52%
+    # of its calls at the shared 4,000 cap.
+    wire_name, budget = _registry_overrides(model)
+    max_tokens = budget or max_tokens
+
     # Every backend goes through the budget guard, including user-added
     # endpoints, because a padding loop is a property of the model rather than
     # of the protocol -- see token_budgets. `sent` equals `max_tokens` unless
     # this model has already been caught padding at this call size.
+    #
+    # Keyed on the registry id, not the wire name, so the learned state follows
+    # the model the user named and survives the endpoint renaming it.
     sent = token_budgets.budget_for(model, max_tokens)
-    result = _dispatch(provider, model, system, user, schema, sent)
+    result = _dispatch(provider, wire_name, system, user, schema, sent)
     token_budgets.observe(model, max_tokens, sent, result)
     return result
+
+
+def _registry_overrides(model: str) -> tuple[str, int | None]:
+    """What the installation's registry says to send for this model.
+
+    Returns `(wire_name, max_tokens)`. The id is a local handle -- it reaches
+    filenames, report rows and the budget keys above -- and it may differ from
+    what the endpoint calls the model: aggregators publish namespaced ids such
+    as `meta/llama-4-scout-17b-16e-instruct`, which cannot be an id here
+    because it would reach a path. Only the outgoing call is rewritten;
+    everything the user sees stays the id.
+
+    `max_tokens` is None unless the entry sets one.
+
+    Defensive for the same reason as `provider_for_model`: a broken or
+    hand-edited overlay must not stop the shipped models from being called.
+    """
+    try:
+        import model_registry
+
+        return (model_registry.api_model_for(model) or model,
+                model_registry.max_tokens_for(model))
+    except Exception:                                        # noqa: BLE001
+        return model, None
 
 
 def _dispatch(provider: str, model: str, system: str, user: str,

@@ -18,6 +18,12 @@ Usage:
     python src/manage_models.py add --id qwen3-32b --name "Qwen3 32B" \\
         --provider passau --roles judge,llm_detector
 
+    # an aggregator model whose id is namespaced, with a budget of its own.
+    # The id stays filename-safe; --api-model is what goes on the wire.
+    python src/manage_models.py add --id llama4-scout --name "Llama 4 Scout" \
+        --provider nvidia --roles judge \
+        --api-model meta/llama-4-scout-17b-16e-instruct --max-tokens 4000
+
     # a local Ollama tag for writing the benchmark pairs
     python src/manage_models.py add --id "codellama:13b" \\
         --name "CodeLlama 13B" --provider ollama --roles generator
@@ -115,6 +121,12 @@ def _do_add(args: list[str]) -> int:
 
     if any(r != "ml" for r in roles):
         entry["provider"] = _flag(args, "--provider").strip()
+        # Both optional, and set only when given: an absent flag must not be
+        # stored as a deliberate empty setting.
+        if _flag(args, "--api-model"):
+            entry["api_model"] = _flag(args, "--api-model").strip()
+        if _flag(args, "--max-tokens"):
+            entry["max_tokens"] = _flag(args, "--max-tokens").strip()
     if "ml" in roles:
         entry["directory"] = _flag(args, "--directory").strip()
         entry["word2vec"] = _flag(args, "--word2vec").strip()

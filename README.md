@@ -898,6 +898,9 @@ per-installation overlay lives in the gitignored `models.local.json`. Use the
 .venv\Scripts\python src\manage_models.py list
 .venv\Scripts\python src\manage_models.py add --id qwen3-32b \
     --name "Qwen3 32B" --provider passau --roles judge,llm_detector
+.venv\Scripts\python src\manage_models.py add --id llama4-scout \
+    --name "Llama 4 Scout" --provider nvidia --roles judge \
+    --api-model meta/llama-4-scout-17b-16e-instruct --max-tokens 4000
 .venv\Scripts\python src\manage_models.py disable --id claude-haiku-4-5
 .venv\Scripts\python src\manage_models.py remove --id qwen3-32b
 ```
@@ -921,6 +924,31 @@ Registering one model as both `judge` and `llm_detector` is normal and
 allowed, and using it in both roles on the same run is allowed too — the
 overlap is logged and recorded rather than refused. The generator is the
 exception: a run that names it as a judge or a detector is refused outright.
+
+Two optional fields exist for models an endpoint describes differently from
+the way this framework has to name them.
+
+**API model name.** The id may not contain a slash, because it reaches a
+filename (`judgement_<id>.json`, `detection_<key>.json`) and a URL path. Most
+aggregators -- NVIDIA NIM, OpenRouter -- publish namespaced ids such as
+`meta/llama-4-scout-17b-16e-instruct`, which cannot be an id here. That name
+goes in `api_model` instead: it is what the outgoing call carries, while the
+id stays the short local handle shown in menus, reports and filenames. Blank
+means the id is sent, which is the case for every shipped model.
+
+**Response budget.** One global constant cannot fit two kinds of model.
+`gemma4-31b-it` writes a verdict in about 610 output tokens; a reasoning model
+spends its budget thinking first, and `qwen-agentworld-35b-a3b` needed
+6,200-8,000 tokens before it emitted any JSON -- at the shared 4,000-token cap
+52% of its calls returned an empty string, because the thinking arrives in a
+separate `reasoning_content` field and `content` was never written. A
+per-model `max_tokens` overrides the stage default wherever that model is
+used. Blank means the default, which is right for almost every model.
+
+Both are read by `providers.chat_json`, so they hold for judging, detection
+and generation alike. The padding guard's learned state is keyed on the **id**
+rather than on the wire name, so evidence about a model follows the name you
+gave it even if the endpoint renames the model.
 
 Two things the registry does **not** do. It does not store API keys — those
 stay in `api-keys.txt`, managed by the **Keys** panel further down the same
@@ -1013,6 +1041,42 @@ count at the end of the judging stage, so an empty column is never a mystery.
 For generation a short response fails the existing incomplete-response check
 and is rejected cleanly, which is what already happened to a runaway pair.
 
+### The opposite failure: a model cut off mid-thought
+
+A padding loop wastes the budget. A reasoning model *uses* it, and the symptom
+looks nothing like the one above: the call returns `HTTP 200` with an **empty
+response body** and the sample is dropped for a judgment that never arrived.
+
+`qwen-agentworld-35b-a3b` failed this way on 52% of a 753-sample pass, with
+`No parseable JSON object in model response: ''` and no other clue. The cause
+is that it writes its thinking into a separate `reasoning_content` field while
+`_chat_openai_compatible` reads only `message.content`. One raw call showed
+`reasoning_tokens: 289` of `completion_tokens: 297` — 97% of the budget — so
+when the reasoning runs past the cap, `content` is never written at all and
+the entire answer is lost. Measured across the answered calls: a median of
+2,273 output tokens for a verdict of about 50 characters.
+
+The budget guard correctly refuses to shrink such a model — the tokens are
+real work, not whitespace — so this is not something it can fix. The fix is
+the per-model **response budget** described under the registry above. Four
+samples that returned `''` at 4,000 tokens all answered correctly at 16,000,
+spending 6,448–12,948 output tokens each.
+
+**How to recognise it.** Empty responses with `finish_reason: length` and a
+high `completion_tokens` count mean a reasoning model, not a broken one. Give
+that model a budget of its own rather than raising the shared constant, which
+would undo the learned reduction for every well-behaved model at once.
+
+A related trap, worth knowing before blaming the framework: an endpoint's
+`/v1/models` listing is a catalogue, not a guarantee. Passau advertised two
+models that returned `HTTP 400 invalid model name` — its `/model/info` route
+listed only the four actually deployed — and of ten models advertised by an
+NVIDIA NIM free key, six returned `HTTP 404` and two were retired with
+`HTTP 410 Gone`. A judging pass against an undeployed model fails on every
+sample and admits nothing, because a failed call abstains and a single
+abstaining judge leaves no verdict at all. Test one call before committing a
+full pass.
+
 ---
 
 ## Re-analysing a run, and comparing the passes
@@ -1062,8 +1126,27 @@ unchanged.
 The ranking, the agreement matrix and the per-sample verdict table are all
 built from that same set, so they agree with each other.
 
+**A pass with no detectors selected shows no detectors.** Judging a run without
+re-running the tools archives no round, so the newest round belongs to an
+*earlier* pass -- and reporting it as the current one put the previous
+selection under a heading reading "this pass", every row marked `[STALE]`
+because it had been scored against labels it never saw. Judging records
+`detection_stale_after_judging` whenever results from before it are still on
+disk, and detection clears it again, so the flag answers exactly the question:
+is the newest round still the pass that just ran? When it is not, the current
+pass is empty and says why, and every set of numbers the run has appears below
+as an earlier pass. Select one tool and the current pass holds that one tool,
+at full coverage, however many files the flat directory has accumulated.
+
 Passes recorded before a re-judging are marked as not comparable, because they
 were scored against a different admitted sample set.
+
+Coverage is not reported for a run with no ground truth. An ingested run that
+was never judged has no labelled samples to cover, so the fraction is 0/0; it
+had been rendering as 0% coverage and marking every detector `[STALE]` on a
+run where staleness cannot arise, advising a re-run that would change nothing.
+What is missing there is labels, not verdicts, and the report says that
+separately.
 
 ### Robustness: applying noise to the samples
 

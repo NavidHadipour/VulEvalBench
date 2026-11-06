@@ -340,24 +340,38 @@ async function loadResults() {
   const current = fold(body, 'This pass',
                        [passCount, pass.label].filter(Boolean).join('  ·  '),
                        true);
-  const rankingTable = el('table');
-  current.append(el('p', 'hint',
-    'Standard metrics per detector. Ordered by F1 for readability -- that is '
-    + 'a sort order, not a score, so read the whole row.'));
-  const rankingWrap = el('div', 'scroll');
-  rankingWrap.append(rankingTable);
-  current.append(rankingWrap);
-  buildTable(rankingTable,
-    ['Detector', 'Arm', 'TP', 'FP', 'FN', 'TN', 'Accuracy', 'Precision',
-     'Recall', 'F1', 'FPR', 'FNR', 'MCC', "Youden J", 'CWE id.'],
-    report.ranking.map((row) => [
-      {text: row.name, className: 'strong'}, row.arm,
-      row.tp, row.fp, row.fn, row.tn,
-      fmt(row.accuracy), fmt(row.precision), fmt(row.recall),
-      {text: fmt(row.f1), className: 'strong'},
-      fmt(row.fpr), fmt(row.fnr), fmt(row.mcc), fmt(row.youden_j),
-      fmt(row.cwe_accuracy),
-    ]));
+
+  // A pass that selected no detectors has nothing to rank. The earlier
+  // passes still render beneath, so the sentence has to say which set of
+  // numbers is missing and which ones the reader is about to scroll past --
+  // an empty table here would read as a broken page.
+  if (report.detection_pending) {
+    current.append(el('p', 'hint',
+      'No detector ran against the current labels, so this pass has no '
+      + 'scores. Earlier passes are listed below, each measured on the '
+      + 'samples admitted at the time; re-analyse this run with at least '
+      + 'one tool selected to score the detectors on the labels in force '
+      + 'now.'));
+  } else {
+    const rankingTable = el('table');
+    current.append(el('p', 'hint',
+      'Standard metrics per detector. Ordered by F1 for readability -- that '
+      + 'is a sort order, not a score, so read the whole row.'));
+    const rankingWrap = el('div', 'scroll');
+    rankingWrap.append(rankingTable);
+    current.append(rankingWrap);
+    buildTable(rankingTable,
+      ['Detector', 'Arm', 'TP', 'FP', 'FN', 'TN', 'Accuracy', 'Precision',
+       'Recall', 'F1', 'FPR', 'FNR', 'MCC', "Youden J", 'CWE id.'],
+      report.ranking.map((row) => [
+        {text: row.name, className: 'strong'}, row.arm,
+        row.tp, row.fp, row.fn, row.tn,
+        fmt(row.accuracy), fmt(row.precision), fmt(row.recall),
+        {text: fmt(row.f1), className: 'strong'},
+        fmt(row.fpr), fmt(row.fnr), fmt(row.mcc), fmt(row.youden_j),
+        fmt(row.cwe_accuracy),
+      ]));
+  }
 
   appendComparisons(body, report);
 

@@ -772,6 +772,12 @@ def page_models():
             # mistaken for meaningful configuration.
             if any(role != "ml" for role in roles):
                 entry["provider"] = (form.get("provider") or "").strip()
+                # Both optional, and stored only when given so an untouched
+                # field does not look like a deliberate setting. api_model is
+                # how a namespaced endpoint id is reached at all -- the id
+                # itself may not carry a slash, because it reaches a filename.
+                entry["api_model"] = (form.get("api_model") or "").strip()
+                entry["max_tokens"] = (form.get("max_tokens") or "").strip()
             if "ml" in roles:
                 entry["directory"] = (form.get("directory") or "").strip()
                 entry["word2vec"] = (form.get("word2vec") or "").strip()

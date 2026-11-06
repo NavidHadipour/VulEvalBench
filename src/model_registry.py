@@ -222,6 +222,39 @@ def provider_of(model_id: str) -> str | None:
     return None
 
 
+def api_model_for(model_id: str) -> str | None:
+    """The name to send on the wire for a registered id, or None.
+
+    None means "send the id itself", which is the case for every shipped model
+    and for any entry that did not need the distinction. Only an entry whose
+    endpoint publishes a namespaced id sets this.
+    """
+    for entry in _entries():
+        if entry["id"] == model_id:
+            return (entry.get("api_model") or "").strip() or None
+    return None
+
+
+def max_tokens_for(model_id: str) -> int | None:
+    """A registered per-model response budget, or None to use the default.
+
+    Read by providers.chat_json, so it applies wherever the model is used --
+    judging, detection or generation -- rather than being set once per stage.
+    """
+    for entry in _entries():
+        if entry["id"] == model_id:
+            value = entry.get("max_tokens")
+            if value in (None, ""):
+                return None
+            try:
+                return max(1, int(value))
+            except (TypeError, ValueError):
+                # Validation refuses this on the way in; a hand-edited file
+                # falls back to the default rather than failing the call.
+                return None
+    return None
+
+
 def ml_families() -> dict[str, dict]:
     """Overlay `ml` entries in the shape detectors/ml_models.py `_FAMILIES` wants.
 
@@ -267,6 +300,30 @@ def validate(entry: dict) -> list[str]:
         problems.append(
             "id must not contain spaces, quotes, slashes or backslashes"
         )
+
+    # The wire name may carry a namespace; the id may not. NVIDIA NIM,
+    # OpenRouter and most aggregators publish ids like
+    # `meta/llama-4-scout-17b-16e-instruct`, which the id rule above refuses
+    # for good reason -- it reaches a filename. Splitting the two means the
+    # local id stays filename-safe while the call still names the model the
+    # endpoint expects. Spaces and quotes are still refused, because nothing
+    # legitimate carries them and they break the JSON payload.
+    api_model = (entry.get("api_model") or "").strip()
+    if api_model and any(c in api_model for c in " \t\"'"):
+        problems.append("api_model must not contain spaces or quotes")
+
+    # A per-model response budget. Added because one global constant cannot
+    # fit both kinds of model: gemma4-31b-it answers a verdict in ~610 tokens
+    # while qwen-agentworld-35b-a3b spends 6,200-8,000 of them reasoning
+    # before it writes anything, and at the shared 4,000 cap 52% of its calls
+    # returned an empty string. Blank means "use the stage's default".
+    budget = entry.get("max_tokens")
+    if budget not in (None, ""):
+        try:
+            if int(budget) < 1:
+                problems.append("max_tokens must be a positive whole number")
+        except (TypeError, ValueError):
+            problems.append("max_tokens must be a positive whole number")
 
     roles = entry.get("roles") or []
     if not roles:

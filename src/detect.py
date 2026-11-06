@@ -303,6 +303,11 @@ def run_detection(
         # Empty on almost every run. Non-empty means at least one detector
         # row is inflated by having judged the set it is scored on.
         detectors_that_also_judged=overlap,
+        # Cleared here because this pass ran against the current labels. The
+        # flag is set by judging, which invalidates whatever detection came
+        # before it; the evaluation reads it to decide whether the newest
+        # archived round is still "this pass".
+        detection_stale_after_judging=False,
     )
 
     log.info(
